@@ -41,6 +41,9 @@ class AutoGenAgentAdapter(Agent):
         self,
         autogen_agent,
         agent_id: Optional[str] = None,
+        capability_weight: float = 1.0,
+        specialization: Optional[dict] = None,
+        role: Optional[str] = None,
         system_message_template: Optional[str] = None,
     ):
         """
@@ -49,11 +52,19 @@ class AutoGenAgentAdapter(Agent):
         Args:
             autogen_agent: AutoGen agent instance (AssistantAgent, etc.)
             agent_id: Optional custom agent ID (uses autogen_agent.name if None)
+            capability_weight: Agent's capability weight (0.0-1.0)
+            specialization: Dict of domain -> proficiency score
+            role: Agent's role (e.g., "analyst", "reviewer")
             system_message_template: Optional template for system messages
         """
         # Use AutoGen agent's name as ID if not provided
         agent_id = agent_id or getattr(autogen_agent, "name", "autogen_agent")
-        super().__init__(agent_id)
+        super().__init__(
+            agent_id=agent_id,
+            capability_weight=capability_weight,
+            specialization=specialization,
+            role=role
+        )
         
         self.autogen_agent = autogen_agent
         self.system_message_template = system_message_template or (

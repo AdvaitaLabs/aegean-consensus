@@ -12,10 +12,29 @@ class Agent(ABC):
     Abstract base class for all agents participating in consensus.
     
     All agent implementations (AutoGen, OpenClaw, Custom) must implement this interface.
+    
+    Attributes:
+        agent_id: Unique identifier for the agent
+        capability_weight: Agent's capability weight (0.0-1.0), used for weighted voting
+        specialization: Dict of domain -> proficiency score (0.0-1.0)
+        role: Agent's role in the group (e.g., "analyst", "reviewer")
     """
 
-    def __init__(self, agent_id: str):
+    def __init__(
+        self,
+        agent_id: str,
+        capability_weight: float = 1.0,
+        specialization: Optional[Dict[str, float]] = None,
+        role: Optional[str] = None
+    ):
         self.agent_id = agent_id
+        self.capability_weight = capability_weight
+        self.specialization = specialization or {}
+        self.role = role
+        
+        # Validate capability_weight
+        if not 0.0 <= capability_weight <= 1.0:
+            raise ValueError(f"capability_weight must be between 0.0 and 1.0, got {capability_weight}")
 
     @abstractmethod
     async def generate_solution(self, task: str) -> Solution:
@@ -43,8 +62,22 @@ class Agent(ABC):
         """
         pass
 
+    def get_weight_for_task(self, task_type: Optional[str] = None) -> float:
+        """
+        Get agent's weight for a specific task type.
+        
+        Args:
+            task_type: Type of task (e.g., "credit_assessment", "fraud_detection")
+            
+        Returns:
+            Effective weight for this task (capability_weight * specialization)
+        """
+        if task_type and task_type in self.specialization:
+            return self.capability_weight * self.specialization[task_type]
+        return self.capability_weight
+    
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(agent_id='{self.agent_id}')"
+        return f"{self.__class__.__name__}(agent_id='{self.agent_id}', weight={self.capability_weight}, role={self.role})"
 
 
 class AgentRegistry:
