@@ -204,7 +204,138 @@ class PromptEnhancer:
             description="Consensus refinement with peer solutions",
             variables=["memory_context", "task", "previous_solutions"]
         )
-    
+
+        # ── Risk validator templates ──────────────────────────────────────────
+
+        self.templates["risk_identity"] = PromptTemplate(
+            name="risk_identity",
+            template="""你是一个专业的身份验证专家（KYA - Know Your Agent/Account）。
+
+{memory_context}
+
+【待评估主体】
+{subject_info}
+
+【当前行为】
+{action_info}
+
+{pre_screen_notes}
+
+请从身份验证角度评估该主体的风险，输出以下格式：
+风险等级: [low/medium/high/critical]
+置信度: [0.0-1.0]
+风险指标: [用逗号分隔的具体风险信号]
+分析: [详细的身份验证分析，2-4句话]""",
+            description="Identity/KYA risk validator prompt",
+            variables=["memory_context", "subject_info", "action_info", "pre_screen_notes"]
+        )
+
+        self.templates["risk_anomaly"] = PromptTemplate(
+            name="risk_anomaly",
+            template="""你是一个专业的异常行为检测专家。
+
+{memory_context}
+
+【主体背景】
+{subject_info}
+
+【当前行为环境】
+{action_info}
+
+{pre_screen_notes}
+
+请从行为异常检测角度评估风险，输出以下格式：
+风险等级: [low/medium/high/critical]
+置信度: [0.0-1.0]
+风险指标: [用逗号分隔的具体异常信号]
+分析: [详细的行为异常分析，2-4句话]""",
+            description="Behavioral anomaly detection validator prompt",
+            variables=["memory_context", "subject_info", "action_info", "pre_screen_notes"]
+        )
+
+        self.templates["risk_compliance"] = PromptTemplate(
+            name="risk_compliance",
+            template="""你是一个专业的反洗钱(AML)合规专家。
+
+{memory_context}
+
+【合规背景信息】
+{compliance_context}
+
+【主体信息】
+{subject_info}
+
+【交易详情】
+{action_info}
+
+{pre_screen_notes}
+
+请从AML合规角度评估，检查洗钱类型（分层、整合、拆分等），输出以下格式：
+风险等级: [low/medium/high/critical]
+置信度: [0.0-1.0]
+风险指标: [用逗号分隔的具体AML风险信号]
+分析: [详细的合规分析，2-4句话]""",
+            description="AML compliance validator prompt",
+            variables=["memory_context", "compliance_context", "subject_info", "action_info", "pre_screen_notes"]
+        )
+
+        self.templates["risk_amount"] = PromptTemplate(
+            name="risk_amount",
+            template="""你是一个专业的交易金额与频率风险分析师。
+
+{memory_context}
+
+【主体画像】
+{subject_info}
+
+【本次交易】
+{action_info}
+
+【近期行为】
+{velocity_info}
+
+{pre_screen_notes}
+
+请从金额与频率风险角度评估，判断金额是否与主体背景相符，输出以下格式：
+风险等级: [low/medium/high/critical]
+置信度: [0.0-1.0]
+风险指标: [用逗号分隔的具体风险信号]
+分析: [详细分析，2-4句话]""",
+            description="Amount and velocity risk validator prompt",
+            variables=["memory_context", "subject_info", "action_info", "velocity_info", "pre_screen_notes"]
+        )
+
+        self.templates["risk_context"] = PromptTemplate(
+            name="risk_context",
+            template="""你是一个专业的上下文与推理链分析专家。
+
+{memory_context}
+
+【请求主体】
+{subject_info}
+
+【请求详情】
+{action_info}
+
+【推理轨迹 (trace_context)】
+{trace_context}
+
+{pre_screen_notes}
+
+请从上下文一致性和推理合理性角度评估：
+1. 推理链是否内部一致、逻辑通顺？
+2. 当前操作是否与描述的目的相符？
+3. 是否存在推理操纵或欺骗迹象？
+
+输出以下格式：
+风险等级: [low/medium/high/critical]
+置信度: [0.0-1.0]
+风险指标: [用逗号分隔的具体上下文风险信号]
+分析: [详细分析，2-4句话]""",
+            description="Context and reasoning trace validator prompt",
+            variables=["memory_context", "subject_info", "action_info", "trace_context", "pre_screen_notes"]
+        )
+
     async def enhance_prompt(
         self,
         task: str,
