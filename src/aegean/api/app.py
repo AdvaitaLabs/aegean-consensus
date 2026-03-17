@@ -7,12 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from aegean.core.agent import AgentRegistry
 from aegean.api import group_chat_api
+from aegean.api import risk_api
 
 
 def create_app(
     agent_registry: AgentRegistry = None,
     storage_backend = None,
-    enable_cors: bool = True
+    enable_cors: bool = True,
+    memory_system = None,
+    llm_client = None,
 ) -> FastAPI:
     """
     Create and configure FastAPI application.
@@ -50,8 +53,15 @@ def create_app(
     # Initialize GroupChatService
     group_chat_api.init_service(agent_registry, storage_backend)
     
+    # Initialize risk service
+    risk_api.init_risk_service(
+        memory_system=memory_system,
+        llm_client=llm_client,
+    )
+
     # Include routers
     app.include_router(group_chat_api.router)
+    app.include_router(risk_api.router)
     
     @app.get("/")
     async def root():
