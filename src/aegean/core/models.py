@@ -106,3 +106,173 @@ class OpenClawNodeInfo(BaseModel):
     activated_at: Optional[datetime] = None
     last_heartbeat: Optional[datetime] = None
 
+
+class CollaborationMode(str, Enum):
+    """Agent collaboration mode."""
+    COLLABORATION = "collaboration"  # Different agents do different tasks
+    CONSENSUS = "consensus"          # Multiple agents answer same question
+    HYBRID = "hybrid"                # Mix of both
+
+
+class Group(BaseModel):
+    """
+    Group of agents working together.
+    
+    A group can operate in different modes:
+    - Collaboration: Agents work on different subtasks
+    - Consensus: Agents vote on the same question
+    - Hybrid: Mix of both approaches
+    """
+    group_id: str = Field(..., description="Unique group identifier")
+    group_name: str = Field(..., description="Human-readable group name")
+    description: Optional[str] = Field(None, description="Group description")
+    mode: CollaborationMode = Field(
+        CollaborationMode.CONSENSUS,
+        description="Collaboration mode"
+    )
+    created_by: str = Field(..., description="User ID who created this group")
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "group_id": "group-001",
+                "group_name": "Financial Risk Team",
+                "description": "Team for credit assessment and fraud detection",
+                "mode": "hybrid",
+                "created_by": "user_123",
+            }
+        }
+
+
+class GroupMember(BaseModel):
+    """
+    Member of a group (agent).
+    
+    Tracks agent's role, mode, and participation in the group.
+    """
+    group_id: str = Field(..., description="Group this member belongs to")
+    agent_id: str = Field(..., description="Agent identifier")
+    role: Optional[str] = Field(None, description="Agent's role (e.g., 'analyst', 'reviewer')")
+    mode: CollaborationMode = Field(
+        CollaborationMode.CONSENSUS,
+        description="How this agent participates"
+    )
+    capability_weight: float = Field(
+        1.0,
+        ge=0.0,
+        le=1.0,
+        description="Agent's capability weight"
+    )
+    specialization: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Domain -> proficiency mapping"
+    )
+    added_at: datetime = Field(default_factory=datetime.now)
+    is_active: bool = Field(True, description="Whether agent is active in group")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "group_id": "group-001",
+                "agent_id": "agent_0",
+                "role": "credit_analyst",
+                "mode": "consensus",
+                "capability_weight": 1.0,
+                "specialization": {"credit": 0.95, "fraud": 0.85},
+            }
+        }
+
+
+class Message(BaseModel):
+    """
+    Message in a group chat.
+    
+    Can be from user or agent.
+    """
+    message_id: str = Field(..., description="Unique message identifier")
+    group_id: str = Field(..., description="Group this message belongs to")
+    sender_id: str = Field(..., description="Sender ID (user or agent)")
+    sender_type: str = Field(..., description="Sender type: 'user' or 'agent'")
+    content: str = Field(..., description="Message content")
+    timestamp: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message_id": "msg-001",
+                "group_id": "group-001",
+                "sender_id": "user_123",
+                "sender_type": "user",
+                "content": "Evaluate customer credit rating",
+            }
+        }
+
+
+class GroupConsensusResult(BaseModel):
+    """
+    Result of group consensus execution.
+    
+    Extends ConsensusResult with group-specific information.
+    """
+    consensus_id: str
+    group_id: str = Field(..., description="Group that executed this consensus")
+    message_id: Optional[str] = Field(None, description="Message that triggered this")
+    mode: CollaborationMode = Field(..., description="Collaboration mode used")
+    
+    # Consensus results
+    success: bool = Field(..., description="Whether consensus was reached")
+    final_solution: Optional[Solution] = Field(None)
+    
+    # Agent responses (for display)
+    agent_responses: List[Solution] = Field(
+        default_factory=list,
+        description="Individual agent responses"
+    )
+    
+    # Weighted voting details
+    weighted_votes: Optional[Dict[str, float]] = Field(
+        None,
+        description="Weighted votes for each answer"
+    )
+    total_weight: Optional[float] = Field(None, description="Total voting weight")
+    
+    # Execution details
+    rounds_used: int = Field(0, ge=0)
+    participating_agents: List[str] = Field(default_factory=list)
+    execution_time: float = Field(0.0, ge=0.0)
+    consensus_reached: bool = Field(False)
+    
+    # Metadata
+    timestamp: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "consensus_id": "consensus-001",
+                "group_id": "group-001",
+                "message_id": "msg-001",
+                "mode": "consensus",
+                "success": True,
+                "final_solution": {
+                    "agent_id": "consensus",
+                    "answer": "B",
+                    "reasoning": "2 out of 3 agents agreed",
+                },
+                "agent_responses": [
+                    {"agent_id": "agent_0", "answer": "B", "confidence": 0.9},
+                    {"agent_id": "agent_1", "answer": "B", "confidence": 0.85},
+                    {"agent_id": "agent_2", "answer": "C", "confidence": 0.7},
+                ],
+                "weighted_votes": {"B": 1.75, "C": 0.7},
+                "total_weight": 2.45,
+                "rounds_used": 1,
+                "consensus_reached": True,
+            }
+        }
+

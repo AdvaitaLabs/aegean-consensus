@@ -10,6 +10,7 @@ __author__ = "Aegean Contributors"
 
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.agent import Agent, AgentRegistry
+from aegean.core.decision_engine import DecisionEngine, DefaultDecisionEngine
 from aegean.core.models import (
     Solution,
     ConsensusState,
@@ -21,6 +22,8 @@ __all__ = [
     "ConsensusCoordinator",
     "Agent",
     "AgentRegistry",
+    "DecisionEngine",
+    "DefaultDecisionEngine",
     "Solution",
     "ConsensusState",
     "ConsensusResult",
