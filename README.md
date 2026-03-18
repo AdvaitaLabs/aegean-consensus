@@ -10,7 +10,7 @@
 
 *Reaching Agreement Among Reasoning LLM Agents — with Formal Guarantees and Financial-Grade Risk Controls*
 
-[Quick Start](#quick-start) • [Core Protocol](#core-consensus-protocol) • [Risk Assessment](#financial-risk-assessment-trustline-style) • [API Reference](#api-reference) • [Architecture](#system-architecture)
+[Quick Start](#quick-start) • [Core Protocol](#core-consensus-protocol) • [Risk Assessment](#financial-risk-assessment) • [API Reference](#api-reference) • [Architecture](#system-architecture)
 
 </div>
 
@@ -22,7 +22,7 @@ Aegean is a production-ready implementation of the consensus protocol from *"Rea
 
 - **Group Chat System** — multi-agent collaboration with weighted voting
 - **Global Memory** — RAG-powered knowledge base + experience accumulation  
-- **Financial Risk Assessment** — Trustline-inspired VAN (Verification Agent Network) for institution-grade risk evaluation
+- **Financial Risk Assessment** — VAN (Verification Agent Network) for institution-grade risk evaluation
 
 ### Why Aegean?
 
@@ -217,9 +217,9 @@ Pre-built templates for domain-specific tasks:
 
 ---
 
-## Financial Risk Assessment (Trustline-style)
+## Financial Risk Assessment
 
-Aegean implements a **multi-validator consensus-based risk evaluation pipeline** inspired by t54's Trustline VAN architecture. Every agent-initiated financial action passes through a committee of specialist AI validators before execution.
+Aegean implements a **multi-validator consensus-based risk evaluation pipeline** using a VAN (Verification Agent Network) architecture. Every agent-initiated financial action passes through a committee of specialist AI validators before execution.
 
 ### Architecture Overview
 
