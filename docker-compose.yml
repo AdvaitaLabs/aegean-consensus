@@ -1,0 +1,68 @@
+version: '3.9'
+
+services:
+  # ── Aegean API Server ─────────────────────────────────────────────
+  aegean:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: aegean-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - AEGEAN_HOST=0.0.0.0
+      - AEGEAN_PORT=8000
+      - AEGEAN_RELOAD=false
+      - KNOWLEDGE_BACKEND=memory
+      - EXPERIENCE_BACKEND=memory
+    volumes:
+      - ./src:/app/src:ro          # mount source for easy updates
+      - aegean_data:/app/data      # persist seeded knowledge
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aegean-net
+
+  # ── Optional: Milvus (production vector DB) ───────────────────────
+  # Uncomment when you want persistent vector storage
+  # milvus:
+  #   image: milvusdb/milvus:v2.3.3
+  #   container_name: aegean-milvus
+  #   ports:
+  #     - "19530:19530"
+  #   volumes:
+  #     - milvus_data:/var/lib/milvus
+  #   networks:
+  #     - aegean-net
+
+  # ── Optional: PostgreSQL (production experience base) ────────────
+  # postgres:
+  #   image: timescale/timescaledb:latest-pg15
+  #   container_name: aegean-postgres
+  #   ports:
+  #     - "5432:5432"
+  #   environment:
+  #     POSTGRES_USER: aegean
+  #     POSTGRES_PASSWORD: aegean_secret
+  #     POSTGRES_DB: aegean
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - aegean-net
+
+volumes:
+  aegean_data:
+  # milvus_data:
+  # postgres_data:
+
+networks:
+  aegean-net:
+    driver: bridge
+
