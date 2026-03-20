@@ -321,10 +321,24 @@ def create_application():
     from aegean.memory.global_memory import GlobalMemorySystem
 
     # Build memory system
+    experience_backend = os.getenv("EXPERIENCE_BACKEND", "memory")
+    experience_config = {}
+    if experience_backend in ("postgresql", "timescaledb"):
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            logger.warning(
+                "EXPERIENCE_BACKEND=postgresql but DATABASE_URL not set. "
+                "Falling back to memory backend."
+            )
+            experience_backend = "memory"
+        else:
+            experience_config["database_url"] = database_url
+
     memory = GlobalMemorySystem(
         config={
             "knowledge_backend": os.getenv("KNOWLEDGE_BACKEND", "memory"),
-            "experience_backend": os.getenv("EXPERIENCE_BACKEND", "memory"),
+            "experience_backend": experience_backend,
+            "experience_config": experience_config,
         }
     )
 

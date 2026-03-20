@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install LLM provider SDKs
-RUN pip install --no-cache-dir openai
+# Install LLM provider SDKs and required runtime dependencies
+RUN pip install --no-cache-dir openai psycopg2-binary numpy
 
 # Copy source
 COPY src/ ./src/
