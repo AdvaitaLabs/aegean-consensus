@@ -18,10 +18,11 @@ RUN pip install --no-cache-dir openai
 COPY src/ ./src/
 COPY main.py .
 COPY pyproject.toml .
+COPY README.md .
 COPY scripts/ ./scripts/
 
-# Install package in editable mode
-RUN pip install --no-cache-dir -e .
+# Install package
+RUN pip install --no-cache-dir .
 
 # Create data directory
 RUN mkdir -p /app/data
