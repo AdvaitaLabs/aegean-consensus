@@ -73,6 +73,10 @@ def _build_simple_openai_client(api_key: str):
             def __init__(self, api_key: str, model: str, base_url: str = None):
                 client_kwargs = {"api_key": api_key}
                 if base_url:
+                    # Strip trailing /chat/completions if user mistakenly included it
+                    base_url = base_url.rstrip("/")
+                    if base_url.endswith("/chat/completions"):
+                        base_url = base_url[: -len("/chat/completions")]
                     client_kwargs["base_url"] = base_url
                 self.client = openai.AsyncOpenAI(**client_kwargs)
                 self.model = model
@@ -124,25 +128,103 @@ def _build_simple_anthropic_client(api_key: str):
         return None
 
 
+def build_per_agent_llm_clients() -> list:
+    """
+    Build per-agent LLM clients from AGENT_{i}_MODEL env vars.
+
+    Supports two configuration styles:
+
+    Style 1 - All agents share one model (simple):
+        OPENAI_API_KEY=sk-xxx
+        OPENAI_BASE_URL=https://praka.ai/v1
+        OPENAI_MODEL=gpt-4o
+        AEGEAN_AGENT_COUNT=3
+
+    Style 2 - Each agent uses a different model (multi-model consensus):
+        OPENAI_API_KEY=sk-xxx
+        OPENAI_BASE_URL=https://praka.ai/v1
+        AEGEAN_AGENT_COUNT=4
+        AGENT_0_MODEL=gpt-4o
+        AGENT_1_MODEL=deepseek-v3.2
+        AGENT_2_MODEL=gpt-5.1
+        AGENT_3_MODEL=kimi-k2.5-thinking
+
+    Returns list of (model_name, llm_client) tuples.
+    """
+    agent_count = int(os.getenv("AEGEAN_AGENT_COUNT", "3"))
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+    default_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+    # Fix common mistake: base_url should not include /chat/completions
+    if base_url:
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/chat/completions"):
+            base_url = base_url[: -len("/chat/completions")]
+            logger.warning(
+                f"OPENAI_BASE_URL should not include /chat/completions. "
+                f"Auto-corrected to: {base_url}"
+            )
+
+    clients = []
+    for i in range(agent_count):
+        # Per-agent model override: AGENT_0_MODEL, AGENT_1_MODEL, ...
+        model = os.getenv(f"AGENT_{i}_MODEL", default_model)
+        client = None
+        if api_key and not api_key.startswith("sk-your"):
+            client = _build_simple_openai_client_with(api_key, model, base_url)
+        clients.append((model, client))
+        logger.info(f"  agent_{i} -> model={model}")
+
+    return clients
+
+
+def _build_simple_openai_client_with(api_key: str, model: str, base_url: str = None):
+    """Build a single OpenAI-compatible client for a specific model."""
+    try:
+        import openai
+
+        class PerModelClient:
+            def __init__(self, api_key, model, base_url):
+                kwargs = {"api_key": api_key}
+                if base_url:
+                    kwargs["base_url"] = base_url
+                self.client = openai.AsyncOpenAI(**kwargs)
+                self.model = model
+
+            async def complete(self, prompt: str) -> str:
+                resp = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=512,
+                )
+                return resp.choices[0].message.content or ""
+
+        return PerModelClient(api_key, model, base_url)
+    except ImportError:
+        return None
+
+
 def build_agent_registry():
     """
     Build AgentRegistry with configured agents.
 
-    Agent configuration:
-    - Each agent needs an LLM client to generate solutions
-    - capability_weight differentiates domain expertise
-    - specialization maps domain names to proficiency scores
+    Supports per-agent model configuration via AGENT_{i}_MODEL env vars.
+    See build_per_agent_llm_clients() for details.
     """
     from aegean.core.agent import AgentRegistry
 
     registry = AgentRegistry()
     agent_count = int(os.getenv("AEGEAN_AGENT_COUNT", "3"))
-    llm_client = build_llm_client()
 
-    # Try to register AutoGen-based agents if available
+    logger.info(f"Building AgentRegistry with {agent_count} agents:")
+    per_agent_clients = build_per_agent_llm_clients()
+
+    # Try AutoGen adapter first, fall back to minimal agents
     try:
         from aegean.integrations.autogen_adapter import AutoGenAgentAdapter
-        for i in range(agent_count):
+        for i, (model, llm_client) in enumerate(per_agent_clients):
             agent = AutoGenAgentAdapter(
                 agent_id=f"agent_{i}",
                 llm_client=llm_client,
@@ -151,25 +233,32 @@ def build_agent_registry():
             registry.register_agent(agent)
         logger.info(f"Registered {agent_count} AutoGen agents")
     except Exception as e:
-        logger.warning(f"Could not create AutoGen agents ({e}), using minimal agents")
-        _register_minimal_agents(registry, agent_count, llm_client)
+        logger.warning(f"AutoGen not available ({e}), using minimal agents")
+        _register_minimal_agents_multi(registry, per_agent_clients)
 
     logger.info(f"AgentRegistry ready: {registry}")
     return registry
 
 
 def _register_minimal_agents(registry, count: int, llm_client):
+    """Register minimal agents all sharing one LLM client (legacy fallback)."""
+    clients = [(os.getenv("OPENAI_MODEL", "gpt-4o"), llm_client)] * count
+    _register_minimal_agents_multi(registry, clients)
+
+
+def _register_minimal_agents_multi(registry, per_agent_clients: list):
     """
-    Register minimal agents that work without AutoGen.
-    These agents use the LLM client directly.
+    Register minimal agents with per-agent LLM clients.
+    Used when AutoGen is not available.
     """
     from aegean.core.agent import Agent
     from aegean.core.models import Solution
 
     class MinimalAgent(Agent):
-        def __init__(self, agent_id: str, llm_client=None, **kwargs):
+        def __init__(self, agent_id: str, llm_client=None, model_name: str = "", **kwargs):
             super().__init__(agent_id=agent_id, **kwargs)
             self._llm = llm_client
+            self._model_name = model_name
 
         async def generate_solution(self, task: str) -> Solution:
             if self._llm:
@@ -179,7 +268,7 @@ def _register_minimal_agents(registry, count: int, llm_client):
                     )
                     return Solution(agent_id=self.agent_id, answer=answer, confidence=0.8)
                 except Exception as e:
-                    logger.warning(f"{self.agent_id} LLM failed: {e}")
+                    logger.warning(f"{self.agent_id} ({self._model_name}) LLM failed: {e}")
             return Solution(
                 agent_id=self.agent_id,
                 answer=f"[{self.agent_id}] Unable to analyze without LLM",
@@ -189,7 +278,6 @@ def _register_minimal_agents(registry, count: int, llm_client):
         async def refine_solution(self, refinement_set) -> Solution:
             if not refinement_set:
                 return await self.generate_solution("refinement")
-            # Default: agree with majority answer
             from collections import Counter
             answers = [s.answer for s in refinement_set]
             majority = Counter(answers).most_common(1)[0][0]
@@ -200,10 +288,14 @@ def _register_minimal_agents(registry, count: int, llm_client):
                 reasoning="Refined based on peer solutions",
             )
 
-    for i in range(count):
-        agent = MinimalAgent(agent_id=f"agent_{i}", llm_client=llm_client)
+    for i, (model_name, llm_client) in enumerate(per_agent_clients):
+        agent = MinimalAgent(
+            agent_id=f"agent_{i}",
+            llm_client=llm_client,
+            model_name=model_name,
+        )
         registry.register_agent(agent)
-    logger.info(f"Registered {count} minimal agents")
+    logger.info(f"Registered {len(per_agent_clients)} minimal agents")
 
 
 async def seed_on_startup(app_state: dict):
