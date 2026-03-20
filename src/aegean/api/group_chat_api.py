@@ -378,7 +378,7 @@ async def execute_consensus(
     Returns GroupConsensusResult with consensus outcome.
     """
     try:
-        result = service.execute_consensus(
+        result = await service.execute_consensus(
             group_id=group_id,
             task=request.task,
             message_id=request.message_id,

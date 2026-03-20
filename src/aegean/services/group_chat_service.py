@@ -309,7 +309,7 @@ class GroupChatService:
 
     # ==================== Consensus Execution ====================
 
-    def execute_consensus(
+    async def execute_consensus(
         self,
         group_id: str,
         task: str,
