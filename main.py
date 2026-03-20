@@ -65,13 +65,16 @@ def build_llm_client():
 
 
 def _build_simple_openai_client(api_key: str):
-    """Minimal OpenAI client wrapper if no custom client module exists."""
+    """Minimal OpenAI client wrapper supporting custom base_url (OpenAI-compatible endpoints)."""
     try:
         import openai
 
         class SimpleOpenAIClient:
-            def __init__(self, api_key: str, model: str):
-                self.client = openai.AsyncOpenAI(api_key=api_key)
+            def __init__(self, api_key: str, model: str, base_url: str = None):
+                client_kwargs = {"api_key": api_key}
+                if base_url:
+                    client_kwargs["base_url"] = base_url
+                self.client = openai.AsyncOpenAI(**client_kwargs)
                 self.model = model
 
             async def complete(self, prompt: str) -> str:
@@ -84,8 +87,12 @@ def _build_simple_openai_client(api_key: str):
                 return resp.choices[0].message.content or ""
 
         model = os.getenv("OPENAI_MODEL", "gpt-4o")
-        logger.info(f"LLM client: OpenAI built-in ({model})")
-        return SimpleOpenAIClient(api_key=api_key, model=model)
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+        if base_url:
+            logger.info(f"LLM client: OpenAI-compatible ({base_url}) model={model}")
+        else:
+            logger.info(f"LLM client: OpenAI ({model})")
+        return SimpleOpenAIClient(api_key=api_key, model=model, base_url=base_url)
     except ImportError:
         logger.warning("openai package not installed. Run: pip install openai")
         return None

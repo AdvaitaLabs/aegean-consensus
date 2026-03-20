@@ -15,23 +15,48 @@ services:
       - AEGEAN_HOST=0.0.0.0
       - AEGEAN_PORT=8000
       - AEGEAN_RELOAD=false
-      - KNOWLEDGE_BACKEND=memory
-      - EXPERIENCE_BACKEND=memory
+      # Storage: use 'memory' for quick demo, 'postgresql' for persistent test env
+      - KNOWLEDGE_BACKEND=${KNOWLEDGE_BACKEND:-memory}
+      - EXPERIENCE_BACKEND=${EXPERIENCE_BACKEND:-memory}
+      - DATABASE_URL=${DATABASE_URL:-}
     volumes:
-      - ./src:/app/src:ro          # mount source for easy updates
-      - aegean_data:/app/data      # persist seeded knowledge
+      - ./src:/app/src:ro
+      - aegean_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
     restart: unless-stopped
     networks:
       - aegean-net
 
-  # ── Optional: Milvus (production vector DB) ───────────────────────
-  # Uncomment when you want persistent vector storage
+  # ── PostgreSQL (persistent experience base) ───────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: aegean-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: aegean
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aegean_secret}
+      POSTGRES_DB: aegean
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegean"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aegean-net
+
+  # ── Optional: Milvus (production vector DB, uncomment when needed) ─
   # milvus:
   #   image: milvusdb/milvus:v2.3.3
   #   container_name: aegean-milvus
@@ -42,27 +67,11 @@ services:
   #   networks:
   #     - aegean-net
 
-  # ── Optional: PostgreSQL (production experience base) ────────────
-  # postgres:
-  #   image: timescale/timescaledb:latest-pg15
-  #   container_name: aegean-postgres
-  #   ports:
-  #     - "5432:5432"
-  #   environment:
-  #     POSTGRES_USER: aegean
-  #     POSTGRES_PASSWORD: aegean_secret
-  #     POSTGRES_DB: aegean
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   networks:
-  #     - aegean-net
-
 volumes:
   aegean_data:
+  postgres_data:
   # milvus_data:
-  # postgres_data:
 
 networks:
   aegean-net:
     driver: bridge
-
