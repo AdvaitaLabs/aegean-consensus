@@ -1,8 +1,7 @@
 """
 Risk assessment data models.
 
-Defines the core data structures for the financial risk evaluation system,
-inspired by the Trustline VAN (Verification Agent Network) architecture.
+Defines the core data structures for the financial risk evaluation system.
 """
 
 from typing import List, Optional, Dict, Any
@@ -53,6 +52,15 @@ class SessionStatus(str, Enum):
     CHALLENGED = "challenged"
     EXPIRED = "expired"
     FAILED = "failed"
+
+
+# Risk level numeric scores for weighted aggregation
+RISK_LEVEL_SCORE: dict = {
+    RiskLevel.LOW: 0.1,
+    RiskLevel.MEDIUM: 0.4,
+    RiskLevel.HIGH: 0.75,
+    RiskLevel.CRITICAL: 1.0,
+}
 
 
 class ChallengeStatus(str, Enum):
