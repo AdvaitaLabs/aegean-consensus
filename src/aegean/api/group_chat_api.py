@@ -25,6 +25,14 @@ from aegean.core.agent import AgentRegistry
 
 # ==================== Request/Response Models ====================
 
+class InitialMemberSpec(BaseModel):
+    """Specification for initial group member."""
+    agent_id: str = Field(..., description="Agent to add")
+    role: Optional[str] = Field(None, description="Agent's role")
+    capability_weight: float = Field(1.0, ge=0.0, le=1.0)
+    specialization: Optional[Dict[str, float]] = Field(None)
+
+
 class CreateGroupRequest(BaseModel):
     """Request to create a new group."""
     group_name: str = Field(..., description="Human-readable group name")
@@ -34,6 +42,10 @@ class CreateGroupRequest(BaseModel):
         description="Collaboration mode"
     )
     created_by: str = Field(..., description="User ID creating this group")
+    initial_members: Optional[List[InitialMemberSpec]] = Field(
+        None,
+        description="Optional list of agents to add on creation"
+    )
     metadata: Optional[Dict[str, Any]] = Field(None)
 
     class Config:
@@ -43,6 +55,11 @@ class CreateGroupRequest(BaseModel):
                 "description": "Team for credit assessment",
                 "mode": "consensus",
                 "created_by": "user_123",
+                "initial_members": [
+                    {"agent_id": "agent_0", "role": "credit_analyst", "capability_weight": 1.0},
+                    {"agent_id": "agent_1", "role": "fraud_analyst", "capability_weight": 0.95},
+                    {"agent_id": "agent_2", "role": "compliance_officer", "capability_weight": 0.9},
+                ]
             }
         }
 
@@ -128,23 +145,50 @@ def init_service(agent_registry: AgentRegistry, storage_backend=None):
 
 # ==================== Group Management Endpoints ====================
 
+@router.get("/agents", response_model=List[Dict[str, Any]])
+async def list_available_agents(
+    service: GroupChatService = Depends(get_service)
+):
+    """
+    List all available agents that can be added to groups.
+    
+    Returns list of agent info with agent_id, role, and capabilities.
+    """
+    agents = service.agent_registry.get_all_agents()
+    return [
+        {
+            "agent_id": agent.agent_id,
+            "capability_weight": agent.capability_weight,
+            "specialization": agent.specialization,
+            "role": agent.role,
+        }
+        for agent in agents
+    ]
+
+
 @router.post("/", response_model=Group, status_code=201)
 async def create_group(
     request: CreateGroupRequest,
     service: GroupChatService = Depends(get_service)
 ):
     """
-    Create a new agent group.
+    Create a new agent group with optional initial members.
     
     Returns the created Group object.
     """
     try:
+        # Convert initial_members to dict format for service
+        initial_members = None
+        if request.initial_members:
+            initial_members = [m.dict() for m in request.initial_members]
+        
         group = service.create_group(
             group_name=request.group_name,
             created_by=request.created_by,
             description=request.description,
             mode=request.mode,
-            metadata=request.metadata
+            metadata=request.metadata,
+            initial_members=initial_members
         )
         return group
     except Exception as e:
@@ -257,8 +301,13 @@ async def get_members(
         group_id: Group ID
         active_only: If True, only return active members
         
-    Returns list of GroupMember objects.
+    Returns list of GroupMember objects with is_active status.
     """
+    # Verify group exists
+    group = service.get_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
+    
     if active_only:
         members = service.get_active_members(group_id)
     else:

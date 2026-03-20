@@ -62,10 +62,11 @@ class GroupChatService:
         created_by: str,
         description: Optional[str] = None,
         mode: CollaborationMode = CollaborationMode.CONSENSUS,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        initial_members: Optional[List[Dict[str, Any]]] = None
     ) -> Group:
         """
-        Create a new agent group.
+        Create a new agent group with optional initial members.
         
         Args:
             group_name: Human-readable group name
@@ -73,6 +74,8 @@ class GroupChatService:
             description: Optional group description
             mode: Collaboration mode (consensus/collaboration/hybrid)
             metadata: Optional metadata
+            initial_members: Optional list of members to add on creation
+                Each member dict should have: agent_id, and optionally: role, capability_weight, specialization
             
         Returns:
             Created Group object
@@ -91,6 +94,25 @@ class GroupChatService:
         self.groups[group_id] = group
         self.members[group_id] = []
         self.messages[group_id] = []
+        
+        # Add initial members if provided
+        if initial_members:
+            for member_spec in initial_members:
+                agent_id = member_spec.get("agent_id")
+                if not agent_id:
+                    continue
+                try:
+                    self.add_member(
+                        group_id=group_id,
+                        agent_id=agent_id,
+                        role=member_spec.get("role"),
+                        mode=member_spec.get("mode"),
+                        capability_weight=member_spec.get("capability_weight", 1.0),
+                        specialization=member_spec.get("specialization")
+                    )
+                except ValueError:
+                    # Skip if agent already exists or other error
+                    pass
         
         return group
 
@@ -180,7 +202,8 @@ class GroupChatService:
             role=role,
             mode=mode,
             capability_weight=capability_weight,
-            specialization=specialization or {}
+            specialization=specialization or {},
+            is_active=True  # Explicitly set to True
         )
         
         self.members[group_id].append(member)
@@ -296,10 +319,15 @@ class GroupChatService:
         max_rounds: int = 3
     ) -> GroupConsensusResult:
         """
-        Execute consensus with group members.
+        Execute consensus/collaboration with group members.
+        
+        Behavior depends on group mode:
+        - CONSENSUS: All agents answer same question, weighted voting
+        - COLLABORATION: Each agent works independently, no voting
+        - HYBRID: Mix of both (agents first work independently, then consensus)
         
         Args:
-            group_id: Group to execute consensus with
+            group_id: Group to execute with
             task: Task/question for consensus
             message_id: Optional message that triggered this
             quorum_threshold: Weighted quorum threshold (0.0-1.0)
@@ -307,7 +335,7 @@ class GroupChatService:
             max_rounds: Maximum refinement rounds
             
         Returns:
-            GroupConsensusResult with consensus outcome
+            GroupConsensusResult with outcome
             
         Raises:
             ValueError: If group not found or has no active members
@@ -331,62 +359,179 @@ class GroupChatService:
         if not agents:
             raise ValueError(f"No agents found for group {group_id}")
         
-        # Create weighted decision engine
-        decision_engine = WeightedDecisionEngine(
-            quorum_threshold=quorum_threshold,
-            stability_horizon=stability_horizon,
-            agent_registry=self.agent_registry
-        )
-        
-        # Create coordinator
-        coordinator = ConsensusCoordinator(
-            agents=agents,
-            decision_engine=decision_engine,
-            max_rounds=max_rounds
-        )
-        
-        # Execute consensus
         start_time = datetime.now()
-        result = coordinator.run_consensus(task)
-        execution_time = (datetime.now() - start_time).total_seconds()
-        
-        # Collect agent responses from first round
-        agent_responses = []
-        if result.success and coordinator.state.solutions_history:
-            agent_responses = coordinator.state.solutions_history[0]
-        
-        # Calculate weighted votes (if available)
-        weighted_votes = None
-        total_weight = None
-        if agent_responses:
-            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
-                agent_responses
-            )
-        
-        # Create group consensus result
         consensus_id = f"consensus-{uuid.uuid4().hex[:8]}"
         
+        # Handle different collaboration modes
+        if group.mode == CollaborationMode.COLLABORATION:
+            # Collaboration mode: each agent works independently, no voting
+            result = await self._execute_collaboration(agents, task)
+        elif group.mode == CollaborationMode.HYBRID:
+            # Hybrid mode: agents work independently first, then consensus
+            result = await self._execute_hybrid(
+                agents, task, quorum_threshold, stability_horizon, max_rounds
+            )
+        else:
+            # Consensus mode (default): all agents answer same question, weighted voting
+            result = await self._execute_consensus_voting(
+                agents, task, quorum_threshold, stability_horizon, max_rounds
+            )
+        
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        # Build response
         group_result = GroupConsensusResult(
             consensus_id=consensus_id,
             group_id=group_id,
             message_id=message_id,
             mode=group.mode,
-            success=result.success,
-            final_solution=result.final_solution,
-            agent_responses=agent_responses,
-            weighted_votes=weighted_votes,
-            total_weight=total_weight,
-            rounds_used=result.rounds_used,
+            success=result.get("success", False),
+            final_solution=result.get("final_solution"),
+            agent_responses=result.get("agent_responses", []),
+            weighted_votes=result.get("weighted_votes"),
+            total_weight=result.get("total_weight"),
+            rounds_used=result.get("rounds_used", 1),
             participating_agents=[a.agent_id for a in agents],
             execution_time=execution_time,
-            consensus_reached=result.consensus_reached,
-            metadata=result.metadata
+            consensus_reached=result.get("consensus_reached", False),
+            metadata=result.get("metadata", {})
         )
         
         # Store result
         self.consensus_results[consensus_id] = group_result
         
         return group_result
+
+    async def _execute_collaboration(self, agents: List[Agent], task: str) -> Dict[str, Any]:
+        """
+        Collaboration mode: each agent works independently.
+        No voting, just collect all responses.
+        """
+        agent_responses = []
+        for agent in agents:
+            try:
+                solution = await agent.generate_solution(task)
+                agent_responses.append(solution)
+            except Exception as e:
+                # Agent failed, skip
+                pass
+        
+        return {
+            "success": len(agent_responses) > 0,
+            "agent_responses": agent_responses,
+            "final_solution": agent_responses[0] if agent_responses else None,
+            "rounds_used": 1,
+            "consensus_reached": False,
+            "metadata": {"mode": "collaboration", "agent_count": len(agents)}
+        }
+
+    async def _execute_hybrid(
+        self,
+        agents: List[Agent],
+        task: str,
+        quorum_threshold: float,
+        stability_horizon: int,
+        max_rounds: int
+    ) -> Dict[str, Any]:
+        """
+        Hybrid mode: agents work independently first, then consensus on results.
+        """
+        # Phase 1: Independent work
+        initial_responses = []
+        for agent in agents:
+            try:
+                solution = await agent.generate_solution(task)
+                initial_responses.append(solution)
+            except Exception:
+                pass
+        
+        if not initial_responses:
+            return {
+                "success": False,
+                "agent_responses": [],
+                "final_solution": None,
+                "rounds_used": 0,
+                "consensus_reached": False,
+                "metadata": {"mode": "hybrid", "phase": "initial_work_failed"}
+            }
+        
+        # Phase 2: Consensus on results
+        decision_engine = WeightedDecisionEngine(
+            quorum_threshold=quorum_threshold,
+            stability_horizon=stability_horizon,
+            agent_registry=self.agent_registry
+        )
+        
+        coordinator = ConsensusCoordinator(
+            agents=agents,
+            decision_engine=decision_engine,
+            max_rounds=max_rounds
+        )
+        
+        result = coordinator.run_consensus(task)
+        
+        weighted_votes, total_weight = None, None
+        if coordinator.state.solutions_history:
+            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
+                coordinator.state.solutions_history[0]
+            )
+        
+        return {
+            "success": result.success,
+            "agent_responses": initial_responses,
+            "final_solution": result.final_solution,
+            "weighted_votes": weighted_votes,
+            "total_weight": total_weight,
+            "rounds_used": result.rounds_used,
+            "consensus_reached": result.consensus_reached,
+            "metadata": {"mode": "hybrid", "phase": "consensus"}
+        }
+
+    async def _execute_consensus_voting(
+        self,
+        agents: List[Agent],
+        task: str,
+        quorum_threshold: float,
+        stability_horizon: int,
+        max_rounds: int
+    ) -> Dict[str, Any]:
+        """
+        Consensus mode: all agents answer same question, weighted voting.
+        """
+        decision_engine = WeightedDecisionEngine(
+            quorum_threshold=quorum_threshold,
+            stability_horizon=stability_horizon,
+            agent_registry=self.agent_registry
+        )
+        
+        coordinator = ConsensusCoordinator(
+            agents=agents,
+            decision_engine=decision_engine,
+            max_rounds=max_rounds
+        )
+        
+        result = coordinator.run_consensus(task)
+        
+        agent_responses = []
+        if result.success and coordinator.state.solutions_history:
+            agent_responses = coordinator.state.solutions_history[0]
+        
+        weighted_votes, total_weight = None, None
+        if agent_responses:
+            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
+                agent_responses
+            )
+        
+        return {
+            "success": result.success,
+            "agent_responses": agent_responses,
+            "final_solution": result.final_solution,
+            "weighted_votes": weighted_votes,
+            "total_weight": total_weight,
+            "rounds_used": result.rounds_used,
+            "consensus_reached": result.consensus_reached,
+            "metadata": {"mode": "consensus"}
+        }
 
     def get_consensus_result(
         self,
