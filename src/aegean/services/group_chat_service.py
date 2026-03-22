@@ -15,10 +15,13 @@ from aegean.core.models import (
     GroupConsensusResult,
     CollaborationMode,
     Solution,
+    RoundDiscussion,
 )
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.decision_engine import WeightedDecisionEngine
+from aegean.core.discussion_tracker import DiscussionTracker
+from aegean.core.graph_extractor import RiskGraphBuilder
 
 
 class GroupChatService:
@@ -53,6 +56,9 @@ class GroupChatService:
         self.members: Dict[str, List[GroupMember]] = {}  # group_id -> members
         self.messages: Dict[str, List[Message]] = {}  # group_id -> messages
         self.consensus_results: Dict[str, GroupConsensusResult] = {}
+        
+        # Track agent accuracy per group: group_id -> agent_id -> {total, correct}
+        self.agent_accuracy: Dict[str, Dict[str, Dict[str, int]]] = {}
 
     # ==================== Group Management ====================
 
@@ -316,7 +322,8 @@ class GroupChatService:
         message_id: Optional[str] = None,
         quorum_threshold: float = 0.5,
         stability_horizon: int = 2,
-        max_rounds: int = 3
+        max_rounds: int = 3,
+        risk_context: Optional[Dict[str, Any]] = None,
     ) -> GroupConsensusResult:
         """
         Execute consensus/collaboration with group members.
@@ -333,6 +340,7 @@ class GroupChatService:
             quorum_threshold: Weighted quorum threshold (0.0-1.0)
             stability_horizon: Rounds to maintain stability
             max_rounds: Maximum refinement rounds
+            risk_context: Optional risk context for knowledge graph extraction
             
         Returns:
             GroupConsensusResult with outcome
@@ -351,16 +359,21 @@ class GroupChatService:
         
         # Get agents from registry
         agents = []
+        agent_ids = []
         for member in active_members:
             agent = self.agent_registry.get_agent(member.agent_id)
             if agent:
                 agents.append(agent)
+                agent_ids.append(member.agent_id)
         
         if not agents:
             raise ValueError(f"No agents found for group {group_id}")
         
         start_time = datetime.now()
         consensus_id = f"consensus-{uuid.uuid4().hex[:8]}"
+        
+        # Initialize discussion tracker
+        discussion_tracker = DiscussionTracker(group_id, agent_ids)
         
         # Handle different collaboration modes
         if group.mode == CollaborationMode.COLLABORATION:
@@ -369,15 +382,26 @@ class GroupChatService:
         elif group.mode == CollaborationMode.HYBRID:
             # Hybrid mode: agents work independently first, then consensus
             result = await self._execute_hybrid(
-                agents, task, quorum_threshold, stability_horizon, max_rounds
+                agents, task, quorum_threshold, stability_horizon, max_rounds,
+                discussion_tracker
             )
         else:
             # Consensus mode (default): all agents answer same question, weighted voting
             result = await self._execute_consensus_voting(
-                agents, task, quorum_threshold, stability_horizon, max_rounds
+                agents, task, quorum_threshold, stability_horizon, max_rounds,
+                discussion_tracker
             )
         
         execution_time = (datetime.now() - start_time).total_seconds()
+        
+        # Build agent graph from discussion
+        agent_graph = discussion_tracker.build_agent_graph()
+        
+        # Build knowledge graph from risk context if provided
+        knowledge_graph = None
+        if risk_context:
+            graph_builder = RiskGraphBuilder()
+            knowledge_graph = graph_builder.build_from_risk_context(**risk_context)
         
         # Build response
         group_result = GroupConsensusResult(
@@ -388,10 +412,14 @@ class GroupChatService:
             success=result.get("success", False),
             final_solution=result.get("final_solution"),
             agent_responses=result.get("agent_responses", []),
+            discussion_rounds=result.get("discussion_rounds", []),
+            consensus_path=discussion_tracker.get_consensus_path(),
+            agent_graph=agent_graph,
+            knowledge_graph=knowledge_graph,
             weighted_votes=result.get("weighted_votes"),
             total_weight=result.get("total_weight"),
             rounds_used=result.get("rounds_used", 1),
-            participating_agents=[a.agent_id for a in agents],
+            participating_agents=agent_ids,
             execution_time=execution_time,
             consensus_reached=result.get("consensus_reached", False),
             metadata=result.get("metadata", {})
@@ -431,7 +459,8 @@ class GroupChatService:
         task: str,
         quorum_threshold: float,
         stability_horizon: int,
-        max_rounds: int
+        max_rounds: int,
+        discussion_tracker: DiscussionTracker,
     ) -> Dict[str, Any]:
         """
         Hybrid mode: agents work independently first, then consensus on results.
@@ -449,6 +478,7 @@ class GroupChatService:
             return {
                 "success": False,
                 "agent_responses": [],
+                "discussion_rounds": [],
                 "final_solution": None,
                 "rounds_used": 0,
                 "consensus_reached": False,
@@ -470,15 +500,28 @@ class GroupChatService:
         
         result = coordinator.run_consensus(task)
         
+        discussion_rounds = []
+        if result.success and coordinator.state.solutions_history:
+            for round_num, solutions in enumerate(coordinator.state.solutions_history, 1):
+                round_disc = discussion_tracker.record_round(
+                    round_number=round_num,
+                    agent_responses={s.agent_id: s for s in solutions},
+                    candidate_answer=coordinator.state.candidate_solution.answer if coordinator.state.candidate_solution else None,
+                    candidate_confidence=coordinator.state.candidate_solution.confidence if coordinator.state.candidate_solution else None,
+                    stability_counter=coordinator.state.stability_counter,
+                )
+                discussion_rounds.append(round_disc)
+        
         weighted_votes, total_weight = None, None
-        if coordinator.state.solutions_history:
+        if initial_responses:
             weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
-                coordinator.state.solutions_history[0]
+                initial_responses
             )
         
         return {
             "success": result.success,
             "agent_responses": initial_responses,
+            "discussion_rounds": discussion_rounds,
             "final_solution": result.final_solution,
             "weighted_votes": weighted_votes,
             "total_weight": total_weight,
@@ -493,7 +536,8 @@ class GroupChatService:
         task: str,
         quorum_threshold: float,
         stability_horizon: int,
-        max_rounds: int
+        max_rounds: int,
+        discussion_tracker: DiscussionTracker,
     ) -> Dict[str, Any]:
         """
         Consensus mode: all agents answer same question, weighted voting.
@@ -513,8 +557,22 @@ class GroupChatService:
         result = coordinator.run_consensus(task)
         
         agent_responses = []
+        discussion_rounds = []
+        
+        # Record discussion rounds
         if result.success and coordinator.state.solutions_history:
-            agent_responses = coordinator.state.solutions_history[0]
+            for round_num, solutions in enumerate(coordinator.state.solutions_history, 1):
+                agent_responses = solutions
+                
+                # Create round discussion record
+                round_disc = discussion_tracker.record_round(
+                    round_number=round_num,
+                    agent_responses={s.agent_id: s for s in solutions},
+                    candidate_answer=coordinator.state.candidate_solution.answer if coordinator.state.candidate_solution else None,
+                    candidate_confidence=coordinator.state.candidate_solution.confidence if coordinator.state.candidate_solution else None,
+                    stability_counter=coordinator.state.stability_counter,
+                )
+                discussion_rounds.append(round_disc)
         
         weighted_votes, total_weight = None, None
         if agent_responses:
@@ -525,6 +583,7 @@ class GroupChatService:
         return {
             "success": result.success,
             "agent_responses": agent_responses,
+            "discussion_rounds": discussion_rounds,
             "final_solution": result.final_solution,
             "weighted_votes": weighted_votes,
             "total_weight": total_weight,
@@ -565,4 +624,201 @@ class GroupChatService:
             results = results[:limit]
         
         return results
+
+    # ==================== Agent Accuracy Tracking ====================
+
+    def get_agent_accuracy_stats(
+        self,
+        group_id: str,
+        agent_id: str
+    ) -> Dict[str, Any]:
+        """
+        Get agent's accuracy statistics in a group.
+        
+        Args:
+            group_id: Group ID
+            agent_id: Agent ID
+            
+        Returns:
+            Dict with total, correct, and accuracy
+        """
+        if group_id not in self.agent_accuracy:
+            return {"total": 0, "correct": 0, "accuracy": 1.0}
+        
+        if agent_id not in self.agent_accuracy[group_id]:
+            return {"total": 0, "correct": 0, "accuracy": 1.0}
+        
+        stats = self.agent_accuracy[group_id][agent_id]
+        total = stats.get("total", 0)
+        correct = stats.get("correct", 0)
+        
+        accuracy = correct / total if total > 0 else 1.0
+        
+        return {
+            "total": total,
+            "correct": correct,
+            "accuracy": accuracy,
+            "last_updated": datetime.now().isoformat()
+        }
+
+    def update_agent_accuracy(
+        self,
+        group_id: str,
+        agent_id: str,
+        was_correct: bool
+    ) -> None:
+        """
+        Update agent's accuracy based on feedback.
+        
+        Args:
+            group_id: Group ID
+            agent_id: Agent ID
+            was_correct: Whether the agent's answer was correct
+        """
+        # Initialize group accuracy tracking if needed
+        if group_id not in self.agent_accuracy:
+            self.agent_accuracy[group_id] = {}
+        
+        # Initialize agent accuracy if needed
+        if agent_id not in self.agent_accuracy[group_id]:
+            self.agent_accuracy[group_id][agent_id] = {"total": 0, "correct": 0}
+        
+        # Update stats
+        self.agent_accuracy[group_id][agent_id]["total"] += 1
+        if was_correct:
+            self.agent_accuracy[group_id][agent_id]["correct"] += 1
+
+    # ==================== Auto Verification ====================
+
+    async def auto_verify_consensus(
+        self,
+        group_id: str,
+        consensus_id: str,
+        correct_answer: str,
+        verification_source: str = "user_input"
+    ) -> Dict[str, Any]:
+        """
+        自动验证共识结果并更新历史准确率
+        
+        Args:
+            group_id: Group ID
+            consensus_id: Consensus ID
+            correct_answer: The correct answer
+            verification_source: Source of verification (auto/user_input/external_system)
+            
+        Returns:
+            Dict with verification results and accuracy updates
+        """
+        # Get consensus result
+        consensus_result = self.get_consensus_result(consensus_id)
+        if not consensus_result:
+            raise ValueError(f"Consensus {consensus_id} not found")
+        
+        # Compare each agent's answer with correct answer
+        accuracy_updates = []
+        for agent_response in consensus_result.agent_responses:
+            was_correct = agent_response.answer == correct_answer
+            
+            # Update accuracy
+            self.update_agent_accuracy(
+                group_id=group_id,
+                agent_id=agent_response.agent_id,
+                was_correct=was_correct
+            )
+            
+            # Get updated stats
+            stats = self.get_agent_accuracy_stats(group_id, agent_response.agent_id)
+            
+            accuracy_updates.append({
+                "agent_id": agent_response.agent_id,
+                "was_correct": was_correct,
+                "updated_accuracy": stats["accuracy"],
+                "total_evaluations": stats["total"],
+                "correct_count": stats["correct"]
+            })
+        
+        return {
+            "consensus_id": consensus_id,
+            "correct_answer": correct_answer,
+            "verification_source": verification_source,
+            "agent_accuracy_updates": accuracy_updates,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def get_agent_global_stats(self, agent_id: str) -> Dict[str, Any]:
+        """
+        获取 Agent 的全局统计信息
+        
+        Args:
+            agent_id: Agent ID
+            
+        Returns:
+            Dict with global statistics
+        """
+        total_evaluations = 0
+        total_correct = 0
+        group_breakdown = []
+        
+        # Aggregate stats across all groups
+        for group_id in self.agent_accuracy:
+            if agent_id in self.agent_accuracy[group_id]:
+                stats = self.agent_accuracy[group_id][agent_id]
+                group_total = stats.get("total", 0)
+                group_correct = stats.get("correct", 0)
+                
+                total_evaluations += group_total
+                total_correct += group_correct
+                
+                if group_total > 0:
+                    group_breakdown.append({
+                        "group_id": group_id,
+                        "accuracy": group_correct / group_total,
+                        "evaluations": group_total,
+                        "correct_count": group_correct
+                    })
+        
+        global_accuracy = total_correct / total_evaluations if total_evaluations > 0 else 1.0
+        
+        return {
+            "agent_id": agent_id,
+            "global_accuracy": global_accuracy,
+            "total_evaluations": total_evaluations,
+            "correct_count": total_correct,
+            "group_breakdown": group_breakdown,
+            "last_updated": datetime.now().isoformat()
+        }
+
+    def update_member_weight(
+        self,
+        group_id: str,
+        agent_id: str,
+        capability_weight: float
+    ) -> GroupMember:
+        """
+        更新 Agent 的能力权重
+        
+        Args:
+            group_id: Group ID
+            agent_id: Agent ID
+            capability_weight: New capability weight (0.0-1.0)
+            
+        Returns:
+            Updated GroupMember object
+            
+        Raises:
+            ValueError: If agent not found in group
+        """
+        if not 0.0 <= capability_weight <= 1.0:
+            raise ValueError("capability_weight must be between 0.0 and 1.0")
+        
+        members = self.get_members(group_id)
+        member = next((m for m in members if m.agent_id == agent_id), None)
+        
+        if not member:
+            raise ValueError(f"Agent {agent_id} not found in group {group_id}")
+        
+        # Update weight
+        member.capability_weight = capability_weight
+        
+        return member
 

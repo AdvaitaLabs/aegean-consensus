@@ -213,11 +213,169 @@ class Message(BaseModel):
         }
 
 
+class RoundDiscussion(BaseModel):
+    """
+    Discussion record for a single consensus round.
+    
+    Tracks what each agent said and how the consensus evolved.
+    """
+    round_number: int = Field(..., description="Round number (1-indexed)")
+    agent_responses: Dict[str, Solution] = Field(
+        ...,
+        description="agent_id -> Solution for this round"
+    )
+    consensus_status: str = Field(
+        ...,
+        description="Status: 'forming', 'reached', 'diverging'"
+    )
+    candidate_answer: Optional[str] = Field(None, description="Current candidate answer")
+    candidate_confidence: Optional[float] = Field(None, description="Candidate confidence")
+    stability_counter: int = Field(0, description="Consecutive rounds with same candidate")
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+class AgentRelationship(BaseModel):
+    """
+    Relationship between two agents in a group.
+    
+    Tracks influence, trust, and interaction patterns.
+    """
+    source_agent_id: str = Field(..., description="Source agent")
+    target_agent_id: str = Field(..., description="Target agent")
+    influence_weight: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="How much source influences target (0-1)"
+    )
+    trust_score: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="How much target trusts source (0-1)"
+    )
+    disagreement_count: int = Field(0, ge=0, description="Times they disagreed")
+    agreement_count: int = Field(0, ge=0, description="Times they agreed")
+    last_interaction: Optional[datetime] = None
+
+
+class GroupGraph(BaseModel):
+    """
+    Agent relationship graph for a group.
+    
+    Visualizes how agents influence each other.
+    """
+    group_id: str = Field(..., description="Group ID")
+    nodes: List[str] = Field(..., description="Agent IDs in the graph")
+    edges: List[AgentRelationship] = Field(
+        default_factory=list,
+        description="Relationships between agents"
+    )
+    updated_at: datetime = Field(default_factory=datetime.now)
+    
+    def get_key_agents(self) -> List[tuple[str, float]]:
+        """Return agents sorted by total influence (outgoing edges)."""
+        influence_map: Dict[str, float] = {node: 0.0 for node in self.nodes}
+        for edge in self.edges:
+            influence_map[edge.source_agent_id] += edge.influence_weight
+        return sorted(influence_map.items(), key=lambda x: x[1], reverse=True)
+    
+    def get_influence_path(self, from_agent: str, to_agent: str) -> Optional[List[str]]:
+        """Find influence path from one agent to another (BFS)."""
+        if from_agent == to_agent:
+            return [from_agent]
+        
+        visited = set()
+        queue = [(from_agent, [from_agent])]
+        
+        while queue:
+            current, path = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            
+            for edge in self.edges:
+                if edge.source_agent_id == current and edge.influence_weight > 0:
+                    next_agent = edge.target_agent_id
+                    if next_agent == to_agent:
+                        return path + [next_agent]
+                    if next_agent not in visited:
+                        queue.append((next_agent, path + [next_agent]))
+        
+        return None
+
+
+class KnowledgeGraphEntity(BaseModel):
+    """
+    Entity in a knowledge graph (person, company, event, etc).
+    """
+    entity_id: str = Field(..., description="Unique entity ID")
+    entity_type: str = Field(..., description="Type: user, company, event, location, etc")
+    name: str = Field(..., description="Entity name")
+    attributes: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Entity attributes (trust_score, amount, etc)"
+    )
+
+
+class KnowledgeGraphRelation(BaseModel):
+    """
+    Relationship between entities in a knowledge graph.
+    """
+    relation_id: str = Field(..., description="Unique relation ID")
+    source_entity_id: str = Field(..., description="Source entity")
+    target_entity_id: str = Field(..., description="Target entity")
+    relation_type: str = Field(..., description="Type: initiates, transfers, influences, etc")
+    properties: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Relation properties (amount, confidence, etc)"
+    )
+
+
+class KnowledgeGraph(BaseModel):
+    """
+    Knowledge graph extracted from seed data or risk context.
+    
+    Represents entities and their relationships.
+    """
+    graph_id: str = Field(..., description="Unique graph ID")
+    source_type: str = Field(..., description="Source: risk_request, seed_data, etc")
+    source_id: Optional[str] = Field(None, description="ID of source (request_id, etc)")
+    
+    entities: List[KnowledgeGraphEntity] = Field(
+        default_factory=list,
+        description="Nodes in the graph"
+    )
+    relations: List[KnowledgeGraphRelation] = Field(
+        default_factory=list,
+        description="Edges in the graph"
+    )
+    
+    created_at: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    
+    def get_entity(self, entity_id: str) -> Optional[KnowledgeGraphEntity]:
+        """Get entity by ID."""
+        for entity in self.entities:
+            if entity.entity_id == entity_id:
+                return entity
+        return None
+    
+    def get_related_entities(self, entity_id: str, relation_type: Optional[str] = None) -> List[str]:
+        """Get entities related to given entity."""
+        related = []
+        for rel in self.relations:
+            if rel.source_entity_id == entity_id:
+                if relation_type is None or rel.relation_type == relation_type:
+                    related.append(rel.target_entity_id)
+        return related
+
+
 class GroupConsensusResult(BaseModel):
     """
     Result of group consensus execution.
     
-    Extends ConsensusResult with group-specific information.
+    Extends ConsensusResult with group-specific information and discussion history.
     """
     consensus_id: str
     group_id: str = Field(..., description="Group that executed this consensus")
@@ -232,6 +390,28 @@ class GroupConsensusResult(BaseModel):
     agent_responses: List[Solution] = Field(
         default_factory=list,
         description="Individual agent responses"
+    )
+    
+    # Discussion history (NEW)
+    discussion_rounds: List[RoundDiscussion] = Field(
+        default_factory=list,
+        description="Discussion process across rounds"
+    )
+    consensus_path: List[str] = Field(
+        default_factory=list,
+        description="Order of agents that influenced consensus formation"
+    )
+    
+    # Agent relationship graph (NEW)
+    agent_graph: Optional[GroupGraph] = Field(
+        None,
+        description="Agent relationship graph after consensus"
+    )
+    
+    # Knowledge graph (NEW)
+    knowledge_graph: Optional[KnowledgeGraph] = Field(
+        None,
+        description="Knowledge graph extracted from context"
     )
     
     # Weighted voting details
@@ -269,6 +449,20 @@ class GroupConsensusResult(BaseModel):
                     {"agent_id": "agent_1", "answer": "B", "confidence": 0.85},
                     {"agent_id": "agent_2", "answer": "C", "confidence": 0.7},
                 ],
+                "discussion_rounds": [
+                    {
+                        "round_number": 1,
+                        "agent_responses": {
+                            "agent_0": {"agent_id": "agent_0", "answer": "B"},
+                            "agent_1": {"agent_id": "agent_1", "answer": "B"},
+                            "agent_2": {"agent_id": "agent_2", "answer": "C"},
+                        },
+                        "consensus_status": "forming",
+                        "candidate_answer": "B",
+                        "stability_counter": 1,
+                    }
+                ],
+                "consensus_path": ["agent_0", "agent_1", "agent_2"],
                 "weighted_votes": {"B": 1.75, "C": 0.7},
                 "total_weight": 2.45,
                 "rounds_used": 1,
