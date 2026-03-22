@@ -22,7 +22,7 @@ from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.decision_engine import WeightedDecisionEngine
 from aegean.core.discussion_tracker import DiscussionTracker
-from aegean.core.graph_extractor import RiskGraphBuilder
+from aegean.core.graph_extractor import RiskGraphBuilder, GraphExtractor
 
 
 class GroupChatService:
@@ -398,11 +398,28 @@ class GroupChatService:
         # Build agent graph from discussion
         agent_graph = discussion_tracker.build_agent_graph()
         
-        # Build knowledge graph from risk context if provided
+        # Build knowledge graph
+        # Priority:
+        # 1) risk_context provided by caller
+        # 2) fallback: extract from task text + final solution text
         knowledge_graph = None
         if risk_context:
             graph_builder = RiskGraphBuilder()
             knowledge_graph = graph_builder.build_from_risk_context(**risk_context)
+        else:
+            extractor = GraphExtractor()
+            text_parts = [task]
+            final_solution = result.get("final_solution")
+            if final_solution and getattr(final_solution, "answer", None):
+                text_parts.append(final_solution.answer)
+            text = "\n".join([part for part in text_parts if part])
+            extracted_graph = extractor.build_graph(
+                text=text,
+                source_type="consensus_text",
+                source_id=consensus_id,
+            )
+            if extracted_graph.entities or extracted_graph.relations:
+                knowledge_graph = extracted_graph
         
         # Build response
         group_result = GroupConsensusResult(
