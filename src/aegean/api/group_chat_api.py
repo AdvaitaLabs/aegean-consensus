@@ -168,19 +168,29 @@ async def list_available_agents(
 ):
     """
     List all available agents that can be added to groups.
-    
-    Returns list of agent info with agent_id, role, and capabilities.
+
+    Returns agent base profile + global historical stats.
     """
     agents = service.agent_registry.get_all_agents()
-    return [
-        {
-            "agent_id": agent.agent_id,
-            "capability_weight": agent.capability_weight,
-            "specialization": agent.specialization,
-            "role": agent.role,
-        }
-        for agent in agents
-    ]
+    result = []
+
+    for agent in agents:
+        global_stats = service.get_agent_global_stats(agent.agent_id)
+        result.append(
+            {
+                "agent_id": agent.agent_id,
+                "capability_weight": agent.capability_weight,
+                "specialization": agent.specialization,
+                "role": agent.role,
+                "historical_accuracy": global_stats.get("global_accuracy", 1.0),
+                "total_evaluations": global_stats.get("total_evaluations", 0),
+                "correct_count": global_stats.get("correct_count", 0),
+                "group_breakdown": global_stats.get("group_breakdown", []),
+                "last_updated": global_stats.get("last_updated"),
+            }
+        )
+
+    return result
 
 
 @router.post("/", response_model=Group, status_code=201)

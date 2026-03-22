@@ -7,6 +7,7 @@ Handles group creation, member management, message routing, and consensus execut
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import uuid
+import re
 
 from aegean.core.models import (
     Group,
@@ -17,12 +18,15 @@ from aegean.core.models import (
     Solution,
     RoundDiscussion,
     ConsensusConfig,
+    KnowledgeGraph,
+    KnowledgeGraphEntity,
+    KnowledgeGraphRelation,
 )
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.decision_engine import WeightedDecisionEngine
 from aegean.core.discussion_tracker import DiscussionTracker
-from aegean.core.graph_extractor import RiskGraphBuilder, GraphExtractor
+from aegean.core.graph_extractor import RiskGraphBuilder
 
 
 class GroupChatService:
@@ -401,25 +405,18 @@ class GroupChatService:
         # Build knowledge graph
         # Priority:
         # 1) risk_context provided by caller
-        # 2) fallback: extract from task text + final solution text
+        # 2) fallback: derive from multi-round discussion signals
         knowledge_graph = None
         if risk_context:
             graph_builder = RiskGraphBuilder()
             knowledge_graph = graph_builder.build_from_risk_context(**risk_context)
         else:
-            extractor = GraphExtractor()
-            text_parts = [task]
-            final_solution = result.get("final_solution")
-            if final_solution and getattr(final_solution, "answer", None):
-                text_parts.append(final_solution.answer)
-            text = "\n".join([part for part in text_parts if part])
-            extracted_graph = extractor.build_graph(
-                text=text,
-                source_type="consensus_text",
-                source_id=consensus_id,
+            knowledge_graph = self._build_knowledge_graph_from_discussion(
+                consensus_id=consensus_id,
+                group_id=group_id,
+                discussion_rounds=result.get("discussion_rounds", []),
+                agent_ids=agent_ids,
             )
-            if extracted_graph.entities or extracted_graph.relations:
-                knowledge_graph = extracted_graph
         
         # Build response
         group_result = GroupConsensusResult(
@@ -617,6 +614,128 @@ class GroupChatService:
             "consensus_reached": result.consensus_reached,
             "metadata": {"mode": "consensus"}
         }
+
+    def _extract_stance_label(self, answer: str) -> str:
+        """Extract a compact stance label from answer text."""
+        if not answer:
+            return "unknown"
+
+        patterns = [
+            r"\b([ABC])\b",
+            r"\b(APPROVE|REVIEW|REJECT)\b",
+            r"\b(同意|反对|弃权)\b",
+        ]
+
+        upper_answer = answer.upper()
+        for pattern in patterns:
+            match = re.search(pattern, upper_answer)
+            if match:
+                return match.group(1)
+
+        compact = re.sub(r"\s+", " ", answer).strip()
+        return compact[:24] if compact else "unknown"
+
+    def _build_knowledge_graph_from_discussion(
+        self,
+        consensus_id: str,
+        group_id: str,
+        discussion_rounds: List[RoundDiscussion],
+        agent_ids: List[str],
+    ) -> Optional[KnowledgeGraph]:
+        """Build knowledge graph from discussion rounds when no risk_context exists."""
+        if not discussion_rounds:
+            return None
+
+        entities: List[KnowledgeGraphEntity] = []
+        relations: List[KnowledgeGraphRelation] = []
+        entity_ids = set()
+
+        for agent_id in agent_ids:
+            eid = f"agent_{agent_id}"
+            entity_ids.add(eid)
+            entities.append(
+                KnowledgeGraphEntity(
+                    entity_id=eid,
+                    entity_type="agent",
+                    name=agent_id,
+                    attributes={"group_id": group_id},
+                )
+            )
+
+        last_stance_by_agent: Dict[str, str] = {}
+
+        for round_disc in discussion_rounds:
+            round_entity_id = f"round_{round_disc.round_number}"
+            if round_entity_id not in entity_ids:
+                entity_ids.add(round_entity_id)
+                entities.append(
+                    KnowledgeGraphEntity(
+                        entity_id=round_entity_id,
+                        entity_type="round",
+                        name=f"Round {round_disc.round_number}",
+                        attributes={"status": round_disc.consensus_status},
+                    )
+                )
+
+            for agent_id, solution in round_disc.agent_responses.items():
+                stance = self._extract_stance_label(solution.answer)
+                stance_entity_id = f"stance_{stance}"
+
+                if stance_entity_id not in entity_ids:
+                    entity_ids.add(stance_entity_id)
+                    entities.append(
+                        KnowledgeGraphEntity(
+                            entity_id=stance_entity_id,
+                            entity_type="stance",
+                            name=stance,
+                            attributes={},
+                        )
+                    )
+
+                relations.append(
+                    KnowledgeGraphRelation(
+                        relation_id=f"rel_{len(relations)}",
+                        source_entity_id=f"agent_{agent_id}",
+                        target_entity_id=stance_entity_id,
+                        relation_type="supports",
+                        properties={"round": round_disc.round_number},
+                    )
+                )
+
+                relations.append(
+                    KnowledgeGraphRelation(
+                        relation_id=f"rel_{len(relations)}",
+                        source_entity_id=f"agent_{agent_id}",
+                        target_entity_id=round_entity_id,
+                        relation_type="participates_in",
+                        properties={"round": round_disc.round_number},
+                    )
+                )
+
+                if agent_id in last_stance_by_agent and last_stance_by_agent[agent_id] != stance:
+                    relations.append(
+                        KnowledgeGraphRelation(
+                            relation_id=f"rel_{len(relations)}",
+                            source_entity_id=f"agent_{agent_id}",
+                            target_entity_id=stance_entity_id,
+                            relation_type="changes_to",
+                            properties={"round": round_disc.round_number},
+                        )
+                    )
+
+                last_stance_by_agent[agent_id] = stance
+
+        return KnowledgeGraph(
+            graph_id=f"discussion_graph_{uuid.uuid4().hex[:8]}",
+            source_type="discussion_rounds",
+            source_id=consensus_id,
+            entities=entities,
+            relations=relations,
+            metadata={
+                "round_count": len(discussion_rounds),
+                "agent_count": len(agent_ids),
+            },
+        )
 
     def get_consensus_result(
         self,
