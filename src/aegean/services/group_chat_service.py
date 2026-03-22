@@ -398,30 +398,11 @@ class GroupChatService:
         # Build agent graph from discussion
         agent_graph = discussion_tracker.build_agent_graph()
         
-        # Build knowledge graph from risk context if provided, otherwise from agent responses
+        # Build knowledge graph from risk context if provided
         knowledge_graph = None
         if risk_context:
             graph_builder = RiskGraphBuilder()
             knowledge_graph = graph_builder.build_from_risk_context(**risk_context)
-        else:
-            # Build from agent discussion content
-            agent_responses = result.get("agent_responses", [])
-            if agent_responses:
-                combined_text = "\n\n".join(
-                    f"{r.agent_id}: {r.answer}" if hasattr(r, 'agent_id') else str(r)
-                    for r in agent_responses
-                )
-                if combined_text.strip():
-                    from aegean.core.graph_extractor import GraphExtractor
-                    extractor = GraphExtractor()
-                    knowledge_graph = extractor.build_graph(
-                        text=combined_text,
-                        source_type="agent_discussion",
-                        source_id=consensus_id,
-                    )
-                    # Only keep graph if it has entities
-                    if not knowledge_graph.entities:
-                        knowledge_graph = None
         
         # Build response
         group_result = GroupConsensusResult(
