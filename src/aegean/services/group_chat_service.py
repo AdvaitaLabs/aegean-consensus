@@ -405,18 +405,27 @@ class GroupChatService:
         # Build knowledge graph
         # Priority:
         # 1) risk_context provided by caller
-        # 2) fallback: derive from multi-round discussion signals
+        # 2) derive from multi-round discussion signals
+        # 3) fallback: derive from single-round collaboration responses
         knowledge_graph = None
         if risk_context:
             graph_builder = RiskGraphBuilder()
             knowledge_graph = graph_builder.build_from_risk_context(**risk_context)
         else:
+            discussion_rounds = result.get("discussion_rounds", [])
             knowledge_graph = self._build_knowledge_graph_from_discussion(
                 consensus_id=consensus_id,
                 group_id=group_id,
-                discussion_rounds=result.get("discussion_rounds", []),
+                discussion_rounds=discussion_rounds,
                 agent_ids=agent_ids,
             )
+            if knowledge_graph is None:
+                knowledge_graph = self._build_knowledge_graph_from_collaboration_responses(
+                    consensus_id=consensus_id,
+                    group_id=group_id,
+                    agent_responses=result.get("agent_responses", []),
+                    agent_ids=agent_ids,
+                )
         
         # Build response
         group_result = GroupConsensusResult(
@@ -734,6 +743,92 @@ class GroupChatService:
             metadata={
                 "round_count": len(discussion_rounds),
                 "agent_count": len(agent_ids),
+            },
+        )
+
+    def _build_knowledge_graph_from_collaboration_responses(
+        self,
+        consensus_id: str,
+        group_id: str,
+        agent_responses: List[Solution],
+        agent_ids: List[str],
+    ) -> Optional[KnowledgeGraph]:
+        """Build knowledge graph from single-round collaboration responses."""
+        if not agent_responses:
+            return None
+
+        entities: List[KnowledgeGraphEntity] = []
+        relations: List[KnowledgeGraphRelation] = []
+        entity_ids = set()
+
+        for agent_id in agent_ids:
+            eid = f"agent_{agent_id}"
+            if eid in entity_ids:
+                continue
+            entity_ids.add(eid)
+            entities.append(
+                KnowledgeGraphEntity(
+                    entity_id=eid,
+                    entity_type="agent",
+                    name=agent_id,
+                    attributes={"group_id": group_id},
+                )
+            )
+
+        task_entity_id = "collaboration_task"
+        entity_ids.add(task_entity_id)
+        entities.append(
+            KnowledgeGraphEntity(
+                entity_id=task_entity_id,
+                entity_type="task",
+                name="collaboration_task",
+                attributes={"group_id": group_id},
+            )
+        )
+
+        for solution in agent_responses:
+            stance = self._extract_stance_label(solution.answer)
+            stance_entity_id = f"stance_{stance}"
+            if stance_entity_id not in entity_ids:
+                entity_ids.add(stance_entity_id)
+                entities.append(
+                    KnowledgeGraphEntity(
+                        entity_id=stance_entity_id,
+                        entity_type="stance",
+                        name=stance,
+                        attributes={},
+                    )
+                )
+
+            relations.append(
+                KnowledgeGraphRelation(
+                    relation_id=f"rel_{len(relations)}",
+                    source_entity_id=f"agent_{solution.agent_id}",
+                    target_entity_id=stance_entity_id,
+                    relation_type="proposes",
+                    properties={"confidence": solution.confidence},
+                )
+            )
+
+            relations.append(
+                KnowledgeGraphRelation(
+                    relation_id=f"rel_{len(relations)}",
+                    source_entity_id=stance_entity_id,
+                    target_entity_id=task_entity_id,
+                    relation_type="addresses",
+                    properties={},
+                )
+            )
+
+        return KnowledgeGraph(
+            graph_id=f"collaboration_graph_{uuid.uuid4().hex[:8]}",
+            source_type="collaboration_responses",
+            source_id=consensus_id,
+            entities=entities,
+            relations=relations,
+            metadata={
+                "agent_count": len(agent_ids),
+                "response_count": len(agent_responses),
             },
         )
 

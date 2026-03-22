@@ -131,6 +131,9 @@ class RiskDecisionResponse(BaseModel):
     challenge_eligible: bool
     difficulty_level: str
     participating_validators: List[str]
+    weighted_votes: Dict[str, float] = {}
+    rounds_used: int = 1
+    validator_results: List[Dict[str, Any]] = []
     execution_time: float
     timestamp: datetime
     # Challenge info (only present when decision=challenge)
@@ -405,6 +408,20 @@ def _build_response(decision: RiskDecision) -> RiskDecisionResponse:
         challenge_eligible=decision.challenge_eligible,
         difficulty_level=decision.difficulty_level.value,
         participating_validators=decision.participating_validators,
+        weighted_votes=decision.weighted_votes,
+        rounds_used=decision.rounds_used,
+        validator_results=[
+            {
+                "validator_type": vr.validator_type.value,
+                "validator_id": vr.validator_id,
+                "risk_level": vr.risk_level.value,
+                "confidence": vr.confidence,
+                "weight": vr.weight,
+                "reasoning": vr.reasoning,
+                "risk_indicators": vr.risk_indicators,
+            }
+            for vr in decision.validator_results
+        ],
         execution_time=decision.execution_time,
         timestamp=decision.timestamp,
     )
