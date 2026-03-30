@@ -293,7 +293,17 @@ def _register_minimal_agents_multi(registry, per_agent_clients: list):
                     answer = await self._llm.complete(
                         f"Task: {task}\n\nProvide a concise answer:"
                     )
-                    return Solution(agent_id=self.agent_id, answer=answer, confidence=0.8)
+                    raw_usage = getattr(self._llm, "last_usage", None) or {}
+                    from aegean.core.models import TokenUsage as _TU
+                    tu = _TU.from_raw(raw_usage)
+                    return Solution(
+                        agent_id=self.agent_id,
+                        answer=answer,
+                        confidence=0.8,
+                        tokens_prompt=tu.tokens_prompt,
+                        tokens_completion=tu.tokens_completion,
+                        usage=tu,
+                    )
                 except Exception as e:
                     logger.warning(f"{self.agent_id} ({self._model_name}) LLM failed: {e}")
             return Solution(
@@ -306,13 +316,21 @@ def _register_minimal_agents_multi(registry, per_agent_clients: list):
             if not refinement_set:
                 return await self.generate_solution("refinement")
             from collections import Counter
+            from aegean.core.models import TokenUsage as _TU
             answers = [s.answer for s in refinement_set]
             majority = Counter(answers).most_common(1)[0][0]
+            # Aggregate token usage already tracked in peer solutions
+            tp = sum(getattr(s, "tokens_prompt", 0) for s in refinement_set)
+            tc = sum(getattr(s, "tokens_completion", 0) for s in refinement_set)
+            tu = _TU(tokens_prompt=tp, tokens_completion=tc, tokens_total=tp + tc)
             return Solution(
                 agent_id=self.agent_id,
                 answer=majority,
                 confidence=0.75,
                 reasoning="Refined based on peer solutions",
+                tokens_prompt=tp,
+                tokens_completion=tc,
+                usage=tu,
             )
 
     for i, (model_name, llm_client) in enumerate(per_agent_clients):
