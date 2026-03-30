@@ -24,6 +24,7 @@ from aegean.risk.models import (
     RiskDecisionType,
     EvidenceType,
     SessionStatus,
+    TokenUsage,
 )
 from aegean.risk.risk_consensus import RiskConsensusCoordinator
 from aegean.risk.session import SessionManager
@@ -136,6 +137,14 @@ class RiskDecisionResponse(BaseModel):
     validator_results: List[Dict[str, Any]] = []
     execution_time: float
     timestamp: datetime
+
+    # Unified token usage
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    tokens_saved: int = 0
+    provider: Optional[str] = None
+    usage: Optional[Dict[str, int]] = None
+
     # Challenge info (only present when decision=challenge)
     challenge_id: Optional[str] = None
     challenge_instructions: Optional[str] = None
@@ -393,8 +402,45 @@ async def seed_knowledge_base(
 
 # ==================== Helpers ====================
 
+def _aggregate_risk_token_usage(decision: RiskDecision) -> Dict[str, Any]:
+    """Aggregate validator token usage into a unified response payload."""
+    prompt = 0
+    completion = 0
+    saved = 0
+    provider_counts: Dict[str, int] = {}
+
+    for vr in decision.validator_results:
+        meta = vr.metadata or {}
+        usage = TokenUsage.from_raw(meta.get("usage") or meta)
+        prompt += usage.tokens_prompt
+        completion += usage.tokens_completion
+        saved += int(meta.get("tokens_saved") or 0)
+
+        p = meta.get("provider")
+        if p:
+            provider_counts[p] = provider_counts.get(p, 0) + 1
+
+    provider = None
+    if provider_counts:
+        provider = max(provider_counts, key=provider_counts.get)
+
+    usage_obj = TokenUsage(
+        tokens_prompt=prompt,
+        tokens_completion=completion,
+        tokens_total=prompt + completion,
+    )
+    return {
+        "tokens_prompt": usage_obj.tokens_prompt,
+        "tokens_completion": usage_obj.tokens_completion,
+        "tokens_saved": max(saved, 0),
+        "provider": provider,
+        "usage": usage_obj.model_dump(),
+    }
+
+
 def _build_response(decision: RiskDecision) -> RiskDecisionResponse:
     """Convert RiskDecision domain object to API response."""
+    token_payload = _aggregate_risk_token_usage(decision)
     resp = RiskDecisionResponse(
         decision_id=decision.decision_id,
         request_id=decision.request_id,
@@ -419,11 +465,20 @@ def _build_response(decision: RiskDecision) -> RiskDecisionResponse:
                 "weight": vr.weight,
                 "reasoning": vr.reasoning,
                 "risk_indicators": vr.risk_indicators,
+                "tokens_prompt": int((vr.metadata or {}).get("tokens_prompt") or 0),
+                "tokens_completion": int((vr.metadata or {}).get("tokens_completion") or 0),
+                "usage": (vr.metadata or {}).get("usage"),
+                "provider": (vr.metadata or {}).get("provider"),
             }
             for vr in decision.validator_results
         ],
         execution_time=decision.execution_time,
         timestamp=decision.timestamp,
+        tokens_prompt=token_payload["tokens_prompt"],
+        tokens_completion=token_payload["tokens_completion"],
+        tokens_saved=token_payload["tokens_saved"],
+        provider=token_payload["provider"],
+        usage=token_payload["usage"],
     )
 
     # If challenge decision, auto-issue challenge and include in response

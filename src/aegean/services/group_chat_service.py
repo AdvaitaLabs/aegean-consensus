@@ -21,6 +21,7 @@ from aegean.core.models import (
     KnowledgeGraph,
     KnowledgeGraphEntity,
     KnowledgeGraphRelation,
+    TokenUsage,
 )
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
@@ -428,11 +429,16 @@ class GroupChatService:
                 )
         
         # Build response
+        token_solutions = result.get("token_solutions") or result.get("agent_responses", [])
+        token_usage = self._aggregate_solution_tokens(token_solutions)
         group_result = GroupConsensusResult(
             consensus_id=consensus_id,
             group_id=group_id,
             message_id=message_id,
             mode=group.mode,
+            tokens_prompt=token_usage.tokens_prompt,
+            tokens_completion=token_usage.tokens_completion,
+            usage=token_usage,
             success=result.get("success", False),
             final_solution=result.get("final_solution"),
             agent_responses=result.get("agent_responses", []),
@@ -471,6 +477,7 @@ class GroupChatService:
         return {
             "success": len(agent_responses) > 0,
             "agent_responses": agent_responses,
+            "token_solutions": agent_responses,
             "final_solution": agent_responses[0] if agent_responses else None,
             "rounds_used": 1,
             "consensus_reached": False,
@@ -549,6 +556,9 @@ class GroupChatService:
         return {
             "success": result.success,
             "agent_responses": initial_responses,
+            "token_solutions": initial_responses + [
+                s for round_solutions in (coordinator.state.solutions_history or []) for s in round_solutions
+            ],
             "discussion_rounds": discussion_rounds,
             "final_solution": result.final_solution,
             "weighted_votes": weighted_votes,
@@ -612,9 +622,14 @@ class GroupChatService:
                 agent_responses
             )
         
+        token_solutions = [
+            s for round_solutions in (coordinator.state.solutions_history or []) for s in round_solutions
+        ]
+
         return {
             "success": result.success,
             "agent_responses": agent_responses,
+            "token_solutions": token_solutions,
             "discussion_rounds": discussion_rounds,
             "final_solution": result.final_solution,
             "weighted_votes": weighted_votes,
@@ -623,6 +638,37 @@ class GroupChatService:
             "consensus_reached": result.consensus_reached,
             "metadata": {"mode": "consensus"}
         }
+
+    def _aggregate_solution_tokens(self, solutions: List[Solution]) -> TokenUsage:
+        """Aggregate normalized token usage from agent solutions."""
+        prompt = 0
+        completion = 0
+
+        for solution in solutions:
+            usage_obj = solution.usage
+            usage_meta = solution.metadata.get("usage") if isinstance(solution.metadata, dict) else None
+            raw_usage = usage_obj.model_dump() if usage_obj else usage_meta
+            normalized = TokenUsage.from_raw(raw_usage)
+
+            merged_prompt = max(solution.tokens_prompt, normalized.tokens_prompt)
+            merged_completion = max(solution.tokens_completion, normalized.tokens_completion)
+
+            solution.tokens_prompt = merged_prompt
+            solution.tokens_completion = merged_completion
+            solution.usage = TokenUsage(
+                tokens_prompt=merged_prompt,
+                tokens_completion=merged_completion,
+                tokens_total=merged_prompt + merged_completion,
+            )
+
+            prompt += merged_prompt
+            completion += merged_completion
+
+        return TokenUsage(
+            tokens_prompt=prompt,
+            tokens_completion=completion,
+            tokens_total=prompt + completion,
+        )
 
     def _extract_stance_label(self, answer: str) -> str:
         """Extract a compact stance label from answer text."""

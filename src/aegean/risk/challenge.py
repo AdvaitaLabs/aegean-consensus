@@ -314,11 +314,12 @@ class ChallengeManager:
             for e in required_evidence
         )
         return (
-            f"Your request has been flagged for additional review.\n"
+            f"Your request requires additional verification before it can proceed.\n"
             f"{risk_summary}\n\n"
-            f"Reasons: {', '.join(decision.risk_indicators[:3])}\n\n"
-            f"Please provide the following evidence to proceed:\n"
+            f"Why this was flagged: {', '.join(decision.risk_indicators[:3]) or 'risk signals detected'}\n\n"
+            f"Please re-submit supporting materials for review:\n"
             f"{evidence_list}\n\n"
-            f"Submit your response within {DEFAULT_CHALLENGE_TTL_MINUTES} minutes."
+            f"After submitting the materials, the system will automatically re-evaluate your request. "
+            f"Please submit within {DEFAULT_CHALLENGE_TTL_MINUTES} minutes."
         )
 

@@ -80,6 +80,8 @@ def _build_simple_openai_client(api_key: str):
                     client_kwargs["base_url"] = base_url
                 self.client = openai.AsyncOpenAI(**client_kwargs)
                 self.model = model
+                self.last_usage = None
+                self.last_provider = "openai"
 
             async def complete(self, prompt: str) -> str:
                 resp = await self.client.chat.completions.create(
@@ -88,6 +90,12 @@ def _build_simple_openai_client(api_key: str):
                     temperature=0.1,
                     max_tokens=512,
                 )
+                usage = getattr(resp, "usage", None)
+                self.last_usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+                }
                 return resp.choices[0].message.content or ""
 
         model = os.getenv("OPENAI_MODEL", "gpt-4o")
@@ -111,6 +119,8 @@ def _build_simple_anthropic_client(api_key: str):
             def __init__(self, api_key: str, model: str):
                 self.client = anthropic.AsyncAnthropic(api_key=api_key)
                 self.model = model
+                self.last_usage = None
+                self.last_provider = "anthropic"
 
             async def complete(self, prompt: str) -> str:
                 msg = await self.client.messages.create(
@@ -118,6 +128,15 @@ def _build_simple_anthropic_client(api_key: str):
                     max_tokens=512,
                     messages=[{"role": "user", "content": prompt}],
                 )
+                usage = getattr(msg, "usage", None)
+                self.last_usage = {
+                    "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
+                    "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
+                    "total_tokens": (
+                        (getattr(usage, "input_tokens", 0) if usage else 0)
+                        + (getattr(usage, "output_tokens", 0) if usage else 0)
+                    ),
+                }
                 return msg.content[0].text if msg.content else ""
 
         model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
@@ -191,6 +210,8 @@ def _build_simple_openai_client_with(api_key: str, model: str, base_url: str = N
                     kwargs["base_url"] = base_url
                 self.client = openai.AsyncOpenAI(**kwargs)
                 self.model = model
+                self.last_usage = None
+                self.last_provider = "openai"
 
             async def complete(self, prompt: str) -> str:
                 resp = await self.client.chat.completions.create(
@@ -199,6 +220,12 @@ def _build_simple_openai_client_with(api_key: str, model: str, base_url: str = N
                     temperature=0.1,
                     max_tokens=512,
                 )
+                usage = getattr(resp, "usage", None)
+                self.last_usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+                }
                 return resp.choices[0].message.content or ""
 
         return PerModelClient(api_key, model, base_url)

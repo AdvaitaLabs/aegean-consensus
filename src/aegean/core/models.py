@@ -2,7 +2,7 @@
 Data models for the Aegean consensus protocol.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
 from pydantic import BaseModel, Field
@@ -19,6 +19,41 @@ class ConsensusStatus(str, Enum):
     TIMEOUT = "timeout"
 
 
+class TokenUsage(BaseModel):
+    """Unified token usage statistics."""
+    tokens_prompt: int = Field(0, ge=0)
+    tokens_completion: int = Field(0, ge=0)
+    tokens_total: int = Field(0, ge=0)
+
+    @classmethod
+    def from_raw(cls, raw: Optional[Dict[str, Any]]) -> "TokenUsage":
+        if not raw:
+            return cls()
+
+        prompt = int(
+            raw.get("tokens_prompt")
+            or raw.get("prompt_tokens")
+            or raw.get("input_tokens")
+            or 0
+        )
+        completion = int(
+            raw.get("tokens_completion")
+            or raw.get("completion_tokens")
+            or raw.get("output_tokens")
+            or 0
+        )
+        total = int(
+            raw.get("tokens_total")
+            or raw.get("total_tokens")
+            or (prompt + completion)
+        )
+        return cls(
+            tokens_prompt=max(prompt, 0),
+            tokens_completion=max(completion, 0),
+            tokens_total=max(total, 0),
+        )
+
+
 class Solution(BaseModel):
     """Agent's solution to a task."""
     agent_id: str = Field(..., description="ID of the agent that generated this solution")
@@ -26,6 +61,12 @@ class Solution(BaseModel):
     reasoning: str = Field(default="", description="Reasoning trace for this solution")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence score")
     timestamp: datetime = Field(default_factory=datetime.now)
+    tokens_prompt: int = Field(0, ge=0, description="Prompt tokens consumed by this response")
+    tokens_completion: int = Field(0, ge=0, description="Completion tokens consumed by this response")
+    usage: Optional[TokenUsage] = Field(
+        None,
+        description="Optional unified token usage details"
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:
@@ -381,6 +422,14 @@ class GroupConsensusResult(BaseModel):
     group_id: str = Field(..., description="Group that executed this consensus")
     message_id: Optional[str] = Field(None, description="Message that triggered this")
     mode: CollaborationMode = Field(..., description="Collaboration mode used")
+
+    # Unified token usage
+    tokens_prompt: int = Field(0, ge=0, description="Aggregated prompt tokens")
+    tokens_completion: int = Field(0, ge=0, description="Aggregated completion tokens")
+    usage: Optional[TokenUsage] = Field(
+        None,
+        description="Optional aggregate token usage details"
+    )
     
     # Consensus results
     success: bool = Field(..., description="Whether consensus was reached")

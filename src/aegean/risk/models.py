@@ -4,7 +4,7 @@ Risk assessment data models.
 Defines the core data structures for the financial risk evaluation system.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
 from pydantic import BaseModel, Field
@@ -175,6 +175,41 @@ class RiskRequest(BaseModel):
                 }
             }
         }
+
+
+class TokenUsage(BaseModel):
+    """Unified token usage statistics for risk pipeline."""
+    tokens_prompt: int = Field(0, ge=0)
+    tokens_completion: int = Field(0, ge=0)
+    tokens_total: int = Field(0, ge=0)
+
+    @classmethod
+    def from_raw(cls, raw: Optional[Dict[str, Any]]) -> "TokenUsage":
+        if not raw:
+            return cls()
+
+        prompt = int(
+            raw.get("tokens_prompt")
+            or raw.get("prompt_tokens")
+            or raw.get("input_tokens")
+            or 0
+        )
+        completion = int(
+            raw.get("tokens_completion")
+            or raw.get("completion_tokens")
+            or raw.get("output_tokens")
+            or 0
+        )
+        total = int(
+            raw.get("tokens_total")
+            or raw.get("total_tokens")
+            or (prompt + completion)
+        )
+        return cls(
+            tokens_prompt=max(prompt, 0),
+            tokens_completion=max(completion, 0),
+            tokens_total=max(total, 0),
+        )
 
 
 # ==================== Validator Output ====================
