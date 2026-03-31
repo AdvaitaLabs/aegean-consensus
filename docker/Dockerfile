@@ -11,16 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Optional: install openai / anthropic if needed
-# RUN pip install --no-cache-dir openai anthropic
+# Install LLM provider SDKs and required runtime dependencies
+RUN pip install --no-cache-dir openai psycopg2-binary numpy
 
 # Copy source
 COPY src/ ./src/
 COPY main.py .
 COPY pyproject.toml .
+COPY README.md .
+COPY scripts/ ./scripts/
 
-# Install package in editable mode
-RUN pip install --no-cache-dir -e .
+# Install package
+RUN pip install --no-cache-dir .
 
 # Create data directory
 RUN mkdir -p /app/data

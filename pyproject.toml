@@ -58,6 +58,7 @@ Repository = "https://github.com/your-org/aegean-consensus"
 Issues = "https://github.com/your-org/aegean-consensus/issues"
 
 [tool.setuptools]
+package-dir = {"" = "src"}
 packages = ["aegean"]
 
 [tool.black]

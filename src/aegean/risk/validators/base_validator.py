@@ -9,7 +9,7 @@ its own domain-specific risk analysis logic, backed by:
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import logging
 import time
 
@@ -18,6 +18,7 @@ from aegean.risk.models import (
     ValidatorResult,
     ValidatorType,
     RiskLevel,
+    TokenUsage,
 )
 from aegean.memory.global_memory import GlobalMemorySystem
 
@@ -141,6 +142,10 @@ class BaseValidator(ABC):
                     reasoning=pre_result["reasoning"],
                     risk_indicators=pre_result.get("indicators", []),
                     elapsed=time.time() - start,
+                    token_usage=TokenUsage(),
+                    llm_called=False,
+                    llm_skipped_prescreen=True,
+                    tokens_saved=int(self.config.get("estimated_saved_tokens", 512)),
                 )
 
             # Step 2: Retrieve RAG context
@@ -156,9 +161,23 @@ class BaseValidator(ABC):
                     pre_result=pre_result,
                     context_hint=context_hint,
                 )
+                token_usage = llm_result.get("token_usage") if isinstance(llm_result, dict) else None
+                if token_usage is None and isinstance(llm_result, dict):
+                    token_usage = TokenUsage.from_raw(llm_result.get("usage"))
+                if token_usage is None:
+                    token_usage = TokenUsage.from_raw(getattr(self.llm_client, "last_usage", None))
+                if not isinstance(token_usage, TokenUsage):
+                    token_usage = TokenUsage()
+                provider = (
+                    llm_result.get("provider") if isinstance(llm_result, dict) else None
+                ) or getattr(self.llm_client, "last_provider", None)
+                llm_called = True
             else:
                 # No LLM: fall back to pre-screen result or heuristic
                 llm_result = pre_result or self._heuristic_fallback(request)
+                token_usage = TokenUsage()
+                provider = None
+                llm_called = False
 
             elapsed = time.time() - start
             logger.debug(
@@ -173,6 +192,10 @@ class BaseValidator(ABC):
                 reasoning=llm_result["reasoning"],
                 risk_indicators=llm_result.get("indicators", []),
                 elapsed=elapsed,
+                token_usage=token_usage,
+                provider=provider,
+                llm_called=llm_called,
+                tokens_saved=0,
             )
 
         except Exception as e:
@@ -185,6 +208,9 @@ class BaseValidator(ABC):
                 reasoning=f"Validator error: {str(e)}. Defaulting to medium risk.",
                 risk_indicators=["validator_error"],
                 elapsed=time.time() - start,
+                token_usage=TokenUsage(),
+                llm_called=False,
+                tokens_saved=0,
             )
 
     # ==================== Abstract Methods ====================
@@ -284,8 +310,28 @@ class BaseValidator(ABC):
         reasoning: str,
         risk_indicators: List[str],
         elapsed: float = 0.0,
+        token_usage: Optional[TokenUsage] = None,
+        provider: Optional[str] = None,
+        llm_called: bool = False,
+        llm_skipped_prescreen: bool = False,
+        tokens_saved: int = 0,
     ) -> ValidatorResult:
         """Build a ValidatorResult from analysis outputs."""
+        usage = token_usage or TokenUsage()
+        metadata = {
+            "elapsed_seconds": elapsed,
+            "request_id": request.request_id,
+            "tokens_prompt": usage.tokens_prompt,
+            "tokens_completion": usage.tokens_completion,
+            "tokens_total": usage.tokens_total,
+            "usage": usage.model_dump(),
+            "llm_called": llm_called,
+            "llm_skipped_prescreen": llm_skipped_prescreen,
+            "tokens_saved": max(tokens_saved, 0),
+        }
+        if provider:
+            metadata["provider"] = provider
+
         return ValidatorResult(
             validator_type=self.validator_type,
             validator_id=self.validator_id,
@@ -294,10 +340,7 @@ class BaseValidator(ABC):
             reasoning=reasoning,
             risk_indicators=risk_indicators,
             weight=self.capability_weight,
-            metadata={
-                "elapsed_seconds": elapsed,
-                "request_id": request.request_id,
-            },
+            metadata=metadata,
         )
 
     def record_feedback(self, was_correct: bool) -> None:

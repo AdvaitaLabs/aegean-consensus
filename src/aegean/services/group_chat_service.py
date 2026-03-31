@@ -7,6 +7,7 @@ Handles group creation, member management, message routing, and consensus execut
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import uuid
+import re
 
 from aegean.core.models import (
     Group,
@@ -15,10 +16,18 @@ from aegean.core.models import (
     GroupConsensusResult,
     CollaborationMode,
     Solution,
+    RoundDiscussion,
+    ConsensusConfig,
+    KnowledgeGraph,
+    KnowledgeGraphEntity,
+    KnowledgeGraphRelation,
+    TokenUsage,
 )
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.decision_engine import WeightedDecisionEngine
+from aegean.core.discussion_tracker import DiscussionTracker
+from aegean.core.graph_extractor import RiskGraphBuilder
 
 
 class GroupChatService:
@@ -53,6 +62,9 @@ class GroupChatService:
         self.members: Dict[str, List[GroupMember]] = {}  # group_id -> members
         self.messages: Dict[str, List[Message]] = {}  # group_id -> messages
         self.consensus_results: Dict[str, GroupConsensusResult] = {}
+        
+        # Track agent accuracy per group: group_id -> agent_id -> {total, correct}
+        self.agent_accuracy: Dict[str, Dict[str, Dict[str, int]]] = {}
 
     # ==================== Group Management ====================
 
@@ -62,10 +74,11 @@ class GroupChatService:
         created_by: str,
         description: Optional[str] = None,
         mode: CollaborationMode = CollaborationMode.CONSENSUS,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        initial_members: Optional[List[Dict[str, Any]]] = None
     ) -> Group:
         """
-        Create a new agent group.
+        Create a new agent group with optional initial members.
         
         Args:
             group_name: Human-readable group name
@@ -73,6 +86,8 @@ class GroupChatService:
             description: Optional group description
             mode: Collaboration mode (consensus/collaboration/hybrid)
             metadata: Optional metadata
+            initial_members: Optional list of members to add on creation
+                Each member dict should have: agent_id, and optionally: role, capability_weight, specialization
             
         Returns:
             Created Group object
@@ -91,6 +106,25 @@ class GroupChatService:
         self.groups[group_id] = group
         self.members[group_id] = []
         self.messages[group_id] = []
+        
+        # Add initial members if provided
+        if initial_members:
+            for member_spec in initial_members:
+                agent_id = member_spec.get("agent_id")
+                if not agent_id:
+                    continue
+                try:
+                    self.add_member(
+                        group_id=group_id,
+                        agent_id=agent_id,
+                        role=member_spec.get("role"),
+                        mode=member_spec.get("mode"),
+                        capability_weight=member_spec.get("capability_weight", 1.0),
+                        specialization=member_spec.get("specialization")
+                    )
+                except ValueError:
+                    # Skip if agent already exists or other error
+                    pass
         
         return group
 
@@ -180,7 +214,8 @@ class GroupChatService:
             role=role,
             mode=mode,
             capability_weight=capability_weight,
-            specialization=specialization or {}
+            specialization=specialization or {},
+            is_active=True  # Explicitly set to True
         )
         
         self.members[group_id].append(member)
@@ -286,28 +321,35 @@ class GroupChatService:
 
     # ==================== Consensus Execution ====================
 
-    def execute_consensus(
+    async def execute_consensus(
         self,
         group_id: str,
         task: str,
         message_id: Optional[str] = None,
         quorum_threshold: float = 0.5,
         stability_horizon: int = 2,
-        max_rounds: int = 3
+        max_rounds: int = 3,
+        risk_context: Optional[Dict[str, Any]] = None,
     ) -> GroupConsensusResult:
         """
-        Execute consensus with group members.
+        Execute consensus/collaboration with group members.
+        
+        Behavior depends on group mode:
+        - CONSENSUS: All agents answer same question, weighted voting
+        - COLLABORATION: Each agent works independently, no voting
+        - HYBRID: Mix of both (agents first work independently, then consensus)
         
         Args:
-            group_id: Group to execute consensus with
+            group_id: Group to execute with
             task: Task/question for consensus
             message_id: Optional message that triggered this
             quorum_threshold: Weighted quorum threshold (0.0-1.0)
             stability_horizon: Rounds to maintain stability
             max_rounds: Maximum refinement rounds
+            risk_context: Optional risk context for knowledge graph extraction
             
         Returns:
-            GroupConsensusResult with consensus outcome
+            GroupConsensusResult with outcome
             
         Raises:
             ValueError: If group not found or has no active members
@@ -323,70 +365,518 @@ class GroupChatService:
         
         # Get agents from registry
         agents = []
+        agent_ids = []
         for member in active_members:
             agent = self.agent_registry.get_agent(member.agent_id)
             if agent:
                 agents.append(agent)
+                agent_ids.append(member.agent_id)
         
         if not agents:
             raise ValueError(f"No agents found for group {group_id}")
         
-        # Create weighted decision engine
-        decision_engine = WeightedDecisionEngine(
-            quorum_threshold=quorum_threshold,
-            stability_horizon=stability_horizon,
-            agent_registry=self.agent_registry
-        )
-        
-        # Create coordinator
-        coordinator = ConsensusCoordinator(
-            agents=agents,
-            decision_engine=decision_engine,
-            max_rounds=max_rounds
-        )
-        
-        # Execute consensus
         start_time = datetime.now()
-        result = coordinator.run_consensus(task)
-        execution_time = (datetime.now() - start_time).total_seconds()
-        
-        # Collect agent responses from first round
-        agent_responses = []
-        if result.success and coordinator.state.solutions_history:
-            agent_responses = coordinator.state.solutions_history[0]
-        
-        # Calculate weighted votes (if available)
-        weighted_votes = None
-        total_weight = None
-        if agent_responses:
-            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
-                agent_responses
-            )
-        
-        # Create group consensus result
         consensus_id = f"consensus-{uuid.uuid4().hex[:8]}"
         
+        # Initialize discussion tracker
+        discussion_tracker = DiscussionTracker(group_id, agent_ids)
+        
+        # Handle different collaboration modes
+        if group.mode == CollaborationMode.COLLABORATION:
+            # Collaboration mode: each agent works independently, no voting
+            result = await self._execute_collaboration(agents, task)
+        elif group.mode == CollaborationMode.HYBRID:
+            # Hybrid mode: agents work independently first, then consensus
+            result = await self._execute_hybrid(
+                agents, task, quorum_threshold, stability_horizon, max_rounds,
+                discussion_tracker
+            )
+        else:
+            # Consensus mode (default): all agents answer same question, weighted voting
+            result = await self._execute_consensus_voting(
+                agents, task, quorum_threshold, stability_horizon, max_rounds,
+                discussion_tracker
+            )
+        
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        # Build agent graph from discussion
+        agent_graph = discussion_tracker.build_agent_graph()
+        
+        # Build knowledge graph
+        # Priority:
+        # 1) risk_context provided by caller
+        # 2) derive from multi-round discussion signals
+        # 3) fallback: derive from single-round collaboration responses
+        knowledge_graph = None
+        if risk_context:
+            graph_builder = RiskGraphBuilder()
+            knowledge_graph = graph_builder.build_from_risk_context(**risk_context)
+        else:
+            discussion_rounds = result.get("discussion_rounds", [])
+            knowledge_graph = self._build_knowledge_graph_from_discussion(
+                consensus_id=consensus_id,
+                group_id=group_id,
+                discussion_rounds=discussion_rounds,
+                agent_ids=agent_ids,
+            )
+            if knowledge_graph is None:
+                knowledge_graph = self._build_knowledge_graph_from_collaboration_responses(
+                    consensus_id=consensus_id,
+                    group_id=group_id,
+                    agent_responses=result.get("agent_responses", []),
+                    agent_ids=agent_ids,
+                )
+        
+        # Build response
+        token_solutions = result.get("token_solutions") or result.get("agent_responses", [])
+        token_usage = self._aggregate_solution_tokens(token_solutions)
         group_result = GroupConsensusResult(
             consensus_id=consensus_id,
             group_id=group_id,
             message_id=message_id,
             mode=group.mode,
-            success=result.success,
-            final_solution=result.final_solution,
-            agent_responses=agent_responses,
-            weighted_votes=weighted_votes,
-            total_weight=total_weight,
-            rounds_used=result.rounds_used,
-            participating_agents=[a.agent_id for a in agents],
+            tokens_prompt=token_usage.tokens_prompt,
+            tokens_completion=token_usage.tokens_completion,
+            usage=token_usage,
+            success=result.get("success", False),
+            final_solution=result.get("final_solution"),
+            agent_responses=result.get("agent_responses", []),
+            discussion_rounds=result.get("discussion_rounds", []),
+            consensus_path=discussion_tracker.get_consensus_path(),
+            agent_graph=agent_graph,
+            knowledge_graph=knowledge_graph,
+            weighted_votes=result.get("weighted_votes"),
+            total_weight=result.get("total_weight"),
+            rounds_used=result.get("rounds_used", 1),
+            participating_agents=agent_ids,
             execution_time=execution_time,
-            consensus_reached=result.consensus_reached,
-            metadata=result.metadata
+            consensus_reached=result.get("consensus_reached", False),
+            metadata=result.get("metadata", {})
         )
         
         # Store result
         self.consensus_results[consensus_id] = group_result
         
         return group_result
+
+    async def _execute_collaboration(self, agents: List[Agent], task: str) -> Dict[str, Any]:
+        """
+        Collaboration mode: each agent works independently.
+        No voting, just collect all responses.
+        """
+        agent_responses = []
+        for agent in agents:
+            try:
+                solution = await agent.generate_solution(task)
+                agent_responses.append(solution)
+            except Exception as e:
+                # Agent failed, skip
+                pass
+        
+        return {
+            "success": len(agent_responses) > 0,
+            "agent_responses": agent_responses,
+            "token_solutions": agent_responses,
+            "final_solution": agent_responses[0] if agent_responses else None,
+            "rounds_used": 1,
+            "consensus_reached": False,
+            "metadata": {"mode": "collaboration", "agent_count": len(agents)}
+        }
+
+    async def _execute_hybrid(
+        self,
+        agents: List[Agent],
+        task: str,
+        quorum_threshold: float,
+        stability_horizon: int,
+        max_rounds: int,
+        discussion_tracker: DiscussionTracker,
+    ) -> Dict[str, Any]:
+        """
+        Hybrid mode: agents work independently first, then consensus on results.
+        """
+        # Phase 1: Independent work
+        initial_responses = []
+        for agent in agents:
+            try:
+                solution = await agent.generate_solution(task)
+                initial_responses.append(solution)
+            except Exception:
+                pass
+        
+        if not initial_responses:
+            return {
+                "success": False,
+                "agent_responses": [],
+                "discussion_rounds": [],
+                "final_solution": None,
+                "rounds_used": 0,
+                "consensus_reached": False,
+                "metadata": {"mode": "hybrid", "phase": "initial_work_failed"}
+            }
+        
+        # Phase 2: Consensus on results
+        decision_engine = WeightedDecisionEngine(
+            quorum_threshold=quorum_threshold,
+            stability_horizon=stability_horizon,
+            agent_registry=self.agent_registry
+        )
+
+        registry = AgentRegistry()
+        for agent in agents:
+            registry.register_agent(agent)
+
+        coordinator = ConsensusCoordinator(
+            agent_registry=registry,
+            config=ConsensusConfig(max_rounds=max_rounds, stability_horizon=stability_horizon),
+            decision_engine=decision_engine,
+        )
+
+        result = await coordinator.run_consensus(task)
+        
+        discussion_rounds = []
+        if result.success and coordinator.state.solutions_history:
+            for round_num, solutions in enumerate(coordinator.state.solutions_history, 1):
+                round_disc = discussion_tracker.record_round(
+                    round_number=round_num,
+                    agent_responses={s.agent_id: s for s in solutions},
+                    candidate_answer=coordinator.state.candidate_solution.answer if coordinator.state.candidate_solution else None,
+                    candidate_confidence=coordinator.state.candidate_solution.confidence if coordinator.state.candidate_solution else None,
+                    stability_counter=coordinator.state.stability_counter,
+                )
+                discussion_rounds.append(round_disc)
+        
+        weighted_votes, total_weight = None, None
+        if initial_responses:
+            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
+                initial_responses
+            )
+        
+        return {
+            "success": result.success,
+            "agent_responses": initial_responses,
+            "token_solutions": initial_responses + [
+                s for round_solutions in (coordinator.state.solutions_history or []) for s in round_solutions
+            ],
+            "discussion_rounds": discussion_rounds,
+            "final_solution": result.final_solution,
+            "weighted_votes": weighted_votes,
+            "total_weight": total_weight,
+            "rounds_used": result.rounds_used,
+            "consensus_reached": result.consensus_reached,
+            "metadata": {"mode": "hybrid", "phase": "consensus"}
+        }
+
+    async def _execute_consensus_voting(
+        self,
+        agents: List[Agent],
+        task: str,
+        quorum_threshold: float,
+        stability_horizon: int,
+        max_rounds: int,
+        discussion_tracker: DiscussionTracker,
+    ) -> Dict[str, Any]:
+        """
+        Consensus mode: all agents answer same question, weighted voting.
+        """
+        decision_engine = WeightedDecisionEngine(
+            quorum_threshold=quorum_threshold,
+            stability_horizon=stability_horizon,
+            agent_registry=self.agent_registry
+        )
+        
+        registry = AgentRegistry()
+        for agent in agents:
+            registry.register_agent(agent)
+
+        coordinator = ConsensusCoordinator(
+            agent_registry=registry,
+            config=ConsensusConfig(max_rounds=max_rounds, stability_horizon=stability_horizon),
+            decision_engine=decision_engine,
+        )
+
+        result = await coordinator.run_consensus(task)
+        
+        agent_responses = []
+        discussion_rounds = []
+        
+        # Record discussion rounds
+        if result.success and coordinator.state.solutions_history:
+            for round_num, solutions in enumerate(coordinator.state.solutions_history, 1):
+                agent_responses = solutions
+                
+                # Create round discussion record
+                round_disc = discussion_tracker.record_round(
+                    round_number=round_num,
+                    agent_responses={s.agent_id: s for s in solutions},
+                    candidate_answer=coordinator.state.candidate_solution.answer if coordinator.state.candidate_solution else None,
+                    candidate_confidence=coordinator.state.candidate_solution.confidence if coordinator.state.candidate_solution else None,
+                    stability_counter=coordinator.state.stability_counter,
+                )
+                discussion_rounds.append(round_disc)
+        
+        weighted_votes, total_weight = None, None
+        if agent_responses:
+            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
+                agent_responses
+            )
+        
+        token_solutions = [
+            s for round_solutions in (coordinator.state.solutions_history or []) for s in round_solutions
+        ]
+
+        return {
+            "success": result.success,
+            "agent_responses": agent_responses,
+            "token_solutions": token_solutions,
+            "discussion_rounds": discussion_rounds,
+            "final_solution": result.final_solution,
+            "weighted_votes": weighted_votes,
+            "total_weight": total_weight,
+            "rounds_used": result.rounds_used,
+            "consensus_reached": result.consensus_reached,
+            "metadata": {"mode": "consensus"}
+        }
+
+    def _aggregate_solution_tokens(self, solutions: List[Solution]) -> TokenUsage:
+        """Aggregate normalized token usage from agent solutions."""
+        prompt = 0
+        completion = 0
+
+        for solution in solutions:
+            usage_obj = solution.usage
+            usage_meta = solution.metadata.get("usage") if isinstance(solution.metadata, dict) else None
+            raw_usage = usage_obj.model_dump() if usage_obj else usage_meta
+            normalized = TokenUsage.from_raw(raw_usage)
+
+            merged_prompt = max(solution.tokens_prompt, normalized.tokens_prompt)
+            merged_completion = max(solution.tokens_completion, normalized.tokens_completion)
+
+            solution.tokens_prompt = merged_prompt
+            solution.tokens_completion = merged_completion
+            solution.usage = TokenUsage(
+                tokens_prompt=merged_prompt,
+                tokens_completion=merged_completion,
+                tokens_total=merged_prompt + merged_completion,
+            )
+
+            prompt += merged_prompt
+            completion += merged_completion
+
+        return TokenUsage(
+            tokens_prompt=prompt,
+            tokens_completion=completion,
+            tokens_total=prompt + completion,
+        )
+
+    def _extract_stance_label(self, answer: str) -> str:
+        """Extract a compact stance label from answer text."""
+        if not answer:
+            return "unknown"
+
+        patterns = [
+            r"\b([ABC])\b",
+            r"\b(APPROVE|REVIEW|REJECT)\b",
+            r"\b(同意|反对|弃权)\b",
+        ]
+
+        upper_answer = answer.upper()
+        for pattern in patterns:
+            match = re.search(pattern, upper_answer)
+            if match:
+                return match.group(1)
+
+        compact = re.sub(r"\s+", " ", answer).strip()
+        return compact[:24] if compact else "unknown"
+
+    def _build_knowledge_graph_from_discussion(
+        self,
+        consensus_id: str,
+        group_id: str,
+        discussion_rounds: List[RoundDiscussion],
+        agent_ids: List[str],
+    ) -> Optional[KnowledgeGraph]:
+        """Build knowledge graph from discussion rounds when no risk_context exists."""
+        if not discussion_rounds:
+            return None
+
+        entities: List[KnowledgeGraphEntity] = []
+        relations: List[KnowledgeGraphRelation] = []
+        entity_ids = set()
+
+        for agent_id in agent_ids:
+            eid = f"agent_{agent_id}"
+            entity_ids.add(eid)
+            entities.append(
+                KnowledgeGraphEntity(
+                    entity_id=eid,
+                    entity_type="agent",
+                    name=agent_id,
+                    attributes={"group_id": group_id},
+                )
+            )
+
+        last_stance_by_agent: Dict[str, str] = {}
+
+        for round_disc in discussion_rounds:
+            round_entity_id = f"round_{round_disc.round_number}"
+            if round_entity_id not in entity_ids:
+                entity_ids.add(round_entity_id)
+                entities.append(
+                    KnowledgeGraphEntity(
+                        entity_id=round_entity_id,
+                        entity_type="round",
+                        name=f"Round {round_disc.round_number}",
+                        attributes={"status": round_disc.consensus_status},
+                    )
+                )
+
+            for agent_id, solution in round_disc.agent_responses.items():
+                stance = self._extract_stance_label(solution.answer)
+                stance_entity_id = f"stance_{stance}"
+
+                if stance_entity_id not in entity_ids:
+                    entity_ids.add(stance_entity_id)
+                    entities.append(
+                        KnowledgeGraphEntity(
+                            entity_id=stance_entity_id,
+                            entity_type="stance",
+                            name=stance,
+                            attributes={},
+                        )
+                    )
+
+                relations.append(
+                    KnowledgeGraphRelation(
+                        relation_id=f"rel_{len(relations)}",
+                        source_entity_id=f"agent_{agent_id}",
+                        target_entity_id=stance_entity_id,
+                        relation_type="supports",
+                        properties={"round": round_disc.round_number},
+                    )
+                )
+
+                relations.append(
+                    KnowledgeGraphRelation(
+                        relation_id=f"rel_{len(relations)}",
+                        source_entity_id=f"agent_{agent_id}",
+                        target_entity_id=round_entity_id,
+                        relation_type="participates_in",
+                        properties={"round": round_disc.round_number},
+                    )
+                )
+
+                if agent_id in last_stance_by_agent and last_stance_by_agent[agent_id] != stance:
+                    relations.append(
+                        KnowledgeGraphRelation(
+                            relation_id=f"rel_{len(relations)}",
+                            source_entity_id=f"agent_{agent_id}",
+                            target_entity_id=stance_entity_id,
+                            relation_type="changes_to",
+                            properties={"round": round_disc.round_number},
+                        )
+                    )
+
+                last_stance_by_agent[agent_id] = stance
+
+        return KnowledgeGraph(
+            graph_id=f"discussion_graph_{uuid.uuid4().hex[:8]}",
+            source_type="discussion_rounds",
+            source_id=consensus_id,
+            entities=entities,
+            relations=relations,
+            metadata={
+                "round_count": len(discussion_rounds),
+                "agent_count": len(agent_ids),
+            },
+        )
+
+    def _build_knowledge_graph_from_collaboration_responses(
+        self,
+        consensus_id: str,
+        group_id: str,
+        agent_responses: List[Solution],
+        agent_ids: List[str],
+    ) -> Optional[KnowledgeGraph]:
+        """Build knowledge graph from single-round collaboration responses."""
+        if not agent_responses:
+            return None
+
+        entities: List[KnowledgeGraphEntity] = []
+        relations: List[KnowledgeGraphRelation] = []
+        entity_ids = set()
+
+        for agent_id in agent_ids:
+            eid = f"agent_{agent_id}"
+            if eid in entity_ids:
+                continue
+            entity_ids.add(eid)
+            entities.append(
+                KnowledgeGraphEntity(
+                    entity_id=eid,
+                    entity_type="agent",
+                    name=agent_id,
+                    attributes={"group_id": group_id},
+                )
+            )
+
+        task_entity_id = "collaboration_task"
+        entity_ids.add(task_entity_id)
+        entities.append(
+            KnowledgeGraphEntity(
+                entity_id=task_entity_id,
+                entity_type="task",
+                name="collaboration_task",
+                attributes={"group_id": group_id},
+            )
+        )
+
+        for solution in agent_responses:
+            stance = self._extract_stance_label(solution.answer)
+            stance_entity_id = f"stance_{stance}"
+            if stance_entity_id not in entity_ids:
+                entity_ids.add(stance_entity_id)
+                entities.append(
+                    KnowledgeGraphEntity(
+                        entity_id=stance_entity_id,
+                        entity_type="stance",
+                        name=stance,
+                        attributes={},
+                    )
+                )
+
+            relations.append(
+                KnowledgeGraphRelation(
+                    relation_id=f"rel_{len(relations)}",
+                    source_entity_id=f"agent_{solution.agent_id}",
+                    target_entity_id=stance_entity_id,
+                    relation_type="proposes",
+                    properties={"confidence": solution.confidence},
+                )
+            )
+
+            relations.append(
+                KnowledgeGraphRelation(
+                    relation_id=f"rel_{len(relations)}",
+                    source_entity_id=stance_entity_id,
+                    target_entity_id=task_entity_id,
+                    relation_type="addresses",
+                    properties={},
+                )
+            )
+
+        return KnowledgeGraph(
+            graph_id=f"collaboration_graph_{uuid.uuid4().hex[:8]}",
+            source_type="collaboration_responses",
+            source_id=consensus_id,
+            entities=entities,
+            relations=relations,
+            metadata={
+                "agent_count": len(agent_ids),
+                "response_count": len(agent_responses),
+            },
+        )
 
     def get_consensus_result(
         self,
@@ -420,4 +910,201 @@ class GroupChatService:
             results = results[:limit]
         
         return results
+
+    # ==================== Agent Accuracy Tracking ====================
+
+    def get_agent_accuracy_stats(
+        self,
+        group_id: str,
+        agent_id: str
+    ) -> Dict[str, Any]:
+        """
+        Get agent's accuracy statistics in a group.
+        
+        Args:
+            group_id: Group ID
+            agent_id: Agent ID
+            
+        Returns:
+            Dict with total, correct, and accuracy
+        """
+        if group_id not in self.agent_accuracy:
+            return {"total": 0, "correct": 0, "accuracy": 1.0}
+        
+        if agent_id not in self.agent_accuracy[group_id]:
+            return {"total": 0, "correct": 0, "accuracy": 1.0}
+        
+        stats = self.agent_accuracy[group_id][agent_id]
+        total = stats.get("total", 0)
+        correct = stats.get("correct", 0)
+        
+        accuracy = correct / total if total > 0 else 1.0
+        
+        return {
+            "total": total,
+            "correct": correct,
+            "accuracy": accuracy,
+            "last_updated": datetime.now().isoformat()
+        }
+
+    def update_agent_accuracy(
+        self,
+        group_id: str,
+        agent_id: str,
+        was_correct: bool
+    ) -> None:
+        """
+        Update agent's accuracy based on feedback.
+        
+        Args:
+            group_id: Group ID
+            agent_id: Agent ID
+            was_correct: Whether the agent's answer was correct
+        """
+        # Initialize group accuracy tracking if needed
+        if group_id not in self.agent_accuracy:
+            self.agent_accuracy[group_id] = {}
+        
+        # Initialize agent accuracy if needed
+        if agent_id not in self.agent_accuracy[group_id]:
+            self.agent_accuracy[group_id][agent_id] = {"total": 0, "correct": 0}
+        
+        # Update stats
+        self.agent_accuracy[group_id][agent_id]["total"] += 1
+        if was_correct:
+            self.agent_accuracy[group_id][agent_id]["correct"] += 1
+
+    # ==================== Auto Verification ====================
+
+    async def auto_verify_consensus(
+        self,
+        group_id: str,
+        consensus_id: str,
+        correct_answer: str,
+        verification_source: str = "user_input"
+    ) -> Dict[str, Any]:
+        """
+        自动验证共识结果并更新历史准确率
+        
+        Args:
+            group_id: Group ID
+            consensus_id: Consensus ID
+            correct_answer: The correct answer
+            verification_source: Source of verification (auto/user_input/external_system)
+            
+        Returns:
+            Dict with verification results and accuracy updates
+        """
+        # Get consensus result
+        consensus_result = self.get_consensus_result(consensus_id)
+        if not consensus_result:
+            raise ValueError(f"Consensus {consensus_id} not found")
+        
+        # Compare each agent's answer with correct answer
+        accuracy_updates = []
+        for agent_response in consensus_result.agent_responses:
+            was_correct = agent_response.answer == correct_answer
+            
+            # Update accuracy
+            self.update_agent_accuracy(
+                group_id=group_id,
+                agent_id=agent_response.agent_id,
+                was_correct=was_correct
+            )
+            
+            # Get updated stats
+            stats = self.get_agent_accuracy_stats(group_id, agent_response.agent_id)
+            
+            accuracy_updates.append({
+                "agent_id": agent_response.agent_id,
+                "was_correct": was_correct,
+                "updated_accuracy": stats["accuracy"],
+                "total_evaluations": stats["total"],
+                "correct_count": stats["correct"]
+            })
+        
+        return {
+            "consensus_id": consensus_id,
+            "correct_answer": correct_answer,
+            "verification_source": verification_source,
+            "agent_accuracy_updates": accuracy_updates,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def get_agent_global_stats(self, agent_id: str) -> Dict[str, Any]:
+        """
+        获取 Agent 的全局统计信息
+        
+        Args:
+            agent_id: Agent ID
+            
+        Returns:
+            Dict with global statistics
+        """
+        total_evaluations = 0
+        total_correct = 0
+        group_breakdown = []
+        
+        # Aggregate stats across all groups
+        for group_id in self.agent_accuracy:
+            if agent_id in self.agent_accuracy[group_id]:
+                stats = self.agent_accuracy[group_id][agent_id]
+                group_total = stats.get("total", 0)
+                group_correct = stats.get("correct", 0)
+                
+                total_evaluations += group_total
+                total_correct += group_correct
+                
+                if group_total > 0:
+                    group_breakdown.append({
+                        "group_id": group_id,
+                        "accuracy": group_correct / group_total,
+                        "evaluations": group_total,
+                        "correct_count": group_correct
+                    })
+        
+        global_accuracy = total_correct / total_evaluations if total_evaluations > 0 else 1.0
+        
+        return {
+            "agent_id": agent_id,
+            "global_accuracy": global_accuracy,
+            "total_evaluations": total_evaluations,
+            "correct_count": total_correct,
+            "group_breakdown": group_breakdown,
+            "last_updated": datetime.now().isoformat()
+        }
+
+    def update_member_weight(
+        self,
+        group_id: str,
+        agent_id: str,
+        capability_weight: float
+    ) -> GroupMember:
+        """
+        更新 Agent 的能力权重
+        
+        Args:
+            group_id: Group ID
+            agent_id: Agent ID
+            capability_weight: New capability weight (0.0-1.0)
+            
+        Returns:
+            Updated GroupMember object
+            
+        Raises:
+            ValueError: If agent not found in group
+        """
+        if not 0.0 <= capability_weight <= 1.0:
+            raise ValueError("capability_weight must be between 0.0 and 1.0")
+        
+        members = self.get_members(group_id)
+        member = next((m for m in members if m.agent_id == agent_id), None)
+        
+        if not member:
+            raise ValueError(f"Agent {agent_id} not found in group {group_id}")
+        
+        # Update weight
+        member.capability_weight = capability_weight
+        
+        return member
 

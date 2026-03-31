@@ -101,25 +101,30 @@ class ExperienceBase:
             raise ValueError(f"Unsupported backend: {self.backend}")
     
     def _init_timescaledb(self):
-        """Initialize TimescaleDB connection."""
+        """Initialize TimescaleDB/PostgreSQL connection."""
         try:
             import psycopg2
             from psycopg2.extras import RealDictCursor
-            
-            self.conn = psycopg2.connect(
-                host=self.config.get("host", "localhost"),
-                port=self.config.get("port", 5432),
-                database=self.config.get("database", "aegean"),
-                user=self.config.get("user", "postgres"),
-                password=self.config.get("password", "")
-            )
+
+            # Support both DATABASE_URL and individual params
+            database_url = self.config.get("database_url") or self.config.get("DATABASE_URL")
+            if database_url:
+                self.conn = psycopg2.connect(database_url)
+            else:
+                self.conn = psycopg2.connect(
+                    host=self.config.get("host", "localhost"),
+                    port=self.config.get("port", 5432),
+                    database=self.config.get("database", "aegean"),
+                    user=self.config.get("user", "aegean"),
+                    password=self.config.get("password", "")
+                )
             self.cursor = self.conn.cursor(cursor_factory=RealDictCursor)
-            
-            # Create tables if not exist
             self._create_tables()
-            
+
         except ImportError:
-            raise ImportError("psycopg2 not installed. Run: pip install psycopg2-binary")
+            raise ImportError("psycopg2-binary not installed. Run: pip install psycopg2-binary")
+        except Exception as e:
+            raise RuntimeError(f"PostgreSQL connection failed: {e}. Check DATABASE_URL in .env")
     
     def _init_postgresql(self):
         """Initialize PostgreSQL connection."""

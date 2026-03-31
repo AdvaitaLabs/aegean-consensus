@@ -55,6 +55,7 @@ class ConsensusCoordinator:
         """
         self.agent_registry = agent_registry
         self.config = config or ConsensusConfig()
+        self.state: Optional[ConsensusState] = None
         
         # Initialize decision engine
         if decision_engine is None:
@@ -93,6 +94,7 @@ class ConsensusCoordinator:
             consensus_id=consensus_id,
             status=ConsensusStatus.INITIALIZING,
         )
+        self.state = state
         
         try:
             # Step 1: Leader election (Algorithm 1, Line 2-3)
