@@ -6,7 +6,7 @@ import asyncio
 import time
 import uuid
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
@@ -14,6 +14,7 @@ from aegean.core.decision_engine import WeightedDecisionEngine
 from aegean.core.models import ConsensusConfig, Solution
 from aegean.investment.models import (
     AgentOutput,
+    AssetType,
     ConsensusResultView,
     InvestmentAnalysisRequest,
     InvestmentAnalysisResponse,
@@ -21,6 +22,7 @@ from aegean.investment.models import (
     InvestmentMode,
     InvestmentRecommendation,
     InvestmentSummary,
+    MarketCode,
     RecommendationAction,
     RiskGateResult,
 )
@@ -46,6 +48,12 @@ _ACTION_BY_SIGNAL = {
     "neutral": RecommendationAction.HOLD,
 }
 
+_V1_ALLOWED_ASSET_TYPES = {AssetType.EQUITY, AssetType.ETF, AssetType.INDEX}
+_V1_ALLOWED_MARKETS = {MarketCode.CN, MarketCode.HK, MarketCode.US}
+
+
+EventSink = Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
+
 
 class InvestmentAnalysisService:
     """Investment analysis orchestrator across fast/auto/collaborate/roundtable modes."""
@@ -62,32 +70,75 @@ class InvestmentAnalysisService:
         self.llm_client = llm_client
         self.risk_coordinator = risk_coordinator
 
-    async def analyze(self, request: InvestmentAnalysisRequest) -> InvestmentAnalysisResponse:
+    async def analyze(
+        self,
+        request: InvestmentAnalysisRequest,
+        event_sink: EventSink = None,
+    ) -> InvestmentAnalysisResponse:
         started = time.time()
         request_id = f"inv-{uuid.uuid4().hex[:12]}"
 
-        agents = self._select_agents(request.mode)
-        task = self._build_task_prompt(request)
+        await self._emit(event_sink, "analysis_started", request_id=request_id, mode=request.mode.value)
+        self._validate_request(request)
+        await self._emit(event_sink, "request_validated", request_id=request_id)
 
-        solutions = await self._collect_solutions(agents, task)
+        agents = self._select_agents(request.mode)
+        await self._emit(
+            event_sink,
+            "agents_selected",
+            request_id=request_id,
+            agent_ids=[a.agent_id for a in agents],
+        )
+
+        task = self._build_task_prompt(request)
+        solutions = await self._collect_solutions(agents, task, event_sink, request_id)
         agent_outputs = [self._solution_to_output(sol) for sol in solutions]
 
         recommendation, summary = self._merge_outputs(agent_outputs)
+        await self._emit(
+            event_sink,
+            "recommendation_ready",
+            request_id=request_id,
+            action=recommendation.action.value,
+            confidence=recommendation.confidence,
+        )
 
         consensus_view = ConsensusResultView(enabled=False)
         if request.mode == InvestmentMode.ROUNDTABLE and agents:
+            await self._emit(event_sink, "roundtable_started", request_id=request_id)
             consensus_view, recommendation = await self._run_roundtable(task, agents, recommendation)
+            await self._emit(
+                event_sink,
+                "roundtable_finished",
+                request_id=request_id,
+                rounds_used=consensus_view.rounds_used,
+                consensus_reached=consensus_view.consensus_reached,
+            )
 
         risk_gate = await self._evaluate_risk(request, recommendation)
+        await self._emit(
+            event_sink,
+            "risk_gate_finished",
+            request_id=request_id,
+            status=risk_gate.status,
+            risk_level=risk_gate.risk_level,
+        )
 
-        report_md = self._build_report_markdown(request, recommendation, summary, agent_outputs, consensus_view, risk_gate)
+        report_md = self._build_report_markdown(
+            request,
+            recommendation,
+            summary,
+            agent_outputs,
+            consensus_view,
+            risk_gate,
+        )
         metadata = InvestmentMetadata(
             token_usage=self._aggregate_tokens(solutions),
             latency_ms=int((time.time() - started) * 1000),
             data_sources=["public_market_data"],
         )
 
-        return InvestmentAnalysisResponse(
+        response = InvestmentAnalysisResponse(
             request_id=request_id,
             mode=request.mode,
             asset=request.asset,
@@ -100,6 +151,27 @@ class InvestmentAnalysisService:
             report_markdown=report_md,
             metadata=metadata,
         )
+        await self._emit(event_sink, "analysis_completed", request_id=request_id)
+        return response
+
+    def _validate_request(self, request: InvestmentAnalysisRequest) -> None:
+        asset_type = request.asset.asset_type
+        market = request.asset.market
+
+        if market not in _V1_ALLOWED_MARKETS:
+            raise ValueError(
+                f"V1 only supports markets CN/HK/US, got {market.value}."
+            )
+        if asset_type not in _V1_ALLOWED_ASSET_TYPES:
+            if asset_type in {AssetType.FUND, AssetType.CONVERTIBLE_BOND}:
+                raise ValueError(
+                    f"{asset_type.value} is planned for V2. "
+                    "Current V1 supports only equity/etf/index."
+                )
+            raise ValueError(
+                f"{asset_type.value} is planned for V3. "
+                "Current V1 supports only equity/etf/index."
+            )
 
     def _select_agents(self, mode: InvestmentMode) -> List[Agent]:
         all_agents = self.agent_registry.get_all_agents()
@@ -114,24 +186,45 @@ class InvestmentAnalysisService:
             return all_agents[: min(4, len(all_agents))]
         return all_agents[: min(5, len(all_agents))]
 
-    async def _collect_solutions(self, agents: List[Agent], task: str) -> List[Solution]:
+    async def _collect_solutions(
+        self,
+        agents: List[Agent],
+        task: str,
+        event_sink: EventSink,
+        request_id: str,
+    ) -> List[Solution]:
         if not agents:
             return []
-        tasks = [agent.generate_solution(task) for agent in agents]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        async def _run(agent: Agent) -> Tuple[Agent, Any]:
+            try:
+                result = await agent.generate_solution(task)
+                return agent, result
+            except Exception as exc:
+                return agent, exc
+
+        tasks = [asyncio.create_task(_run(agent)) for agent in agents]
         solutions: List[Solution] = []
-        for idx, result in enumerate(results):
+
+        for done_task in asyncio.as_completed(tasks):
+            agent, result = await done_task
             if isinstance(result, Exception):
-                solutions.append(
-                    Solution(
-                        agent_id=agents[idx].agent_id,
-                        answer=f"Agent failed: {result}",
-                        confidence=0.2,
-                    )
+                solution = Solution(
+                    agent_id=agent.agent_id,
+                    answer=f"Agent failed: {result}",
+                    confidence=0.2,
                 )
             else:
-                solutions.append(result)
+                solution = result
+            solutions.append(solution)
+            await self._emit(
+                event_sink,
+                "agent_completed",
+                request_id=request_id,
+                agent_id=solution.agent_id,
+                confidence=solution.confidence,
+            )
+
         return solutions
 
     def _build_task_prompt(self, request: InvestmentAnalysisRequest) -> str:
@@ -187,7 +280,13 @@ class InvestmentAnalysisService:
         confidence = min(weighted[top_signal] / total, 1.0)
 
         action = _ACTION_BY_SIGNAL.get(top_signal, RecommendationAction.HOLD)
-        exposure = 0.15 if action == RecommendationAction.BUY else 0.05 if action == RecommendationAction.HOLD else 0.0
+        exposure = (
+            0.15
+            if action == RecommendationAction.BUY
+            else 0.05
+            if action == RecommendationAction.HOLD
+            else 0.0
+        )
 
         rec = InvestmentRecommendation(
             action=action,
@@ -214,7 +313,11 @@ class InvestmentAnalysisService:
         for agent in agents:
             registry.register_agent(agent)
 
-        engine = WeightedDecisionEngine(quorum_threshold=0.5, stability_horizon=2, agent_registry=registry)
+        engine = WeightedDecisionEngine(
+            quorum_threshold=0.5,
+            stability_horizon=2,
+            agent_registry=registry,
+        )
         coordinator = ConsensusCoordinator(
             agent_registry=registry,
             config=ConsensusConfig(max_rounds=3, stability_horizon=2),
@@ -227,7 +330,10 @@ class InvestmentAnalysisService:
             action = _ACTION_BY_SIGNAL.get(signal, current_recommendation.action)
             recommendation = InvestmentRecommendation(
                 action=action,
-                confidence=max(current_recommendation.confidence, result.final_solution.confidence),
+                confidence=max(
+                    current_recommendation.confidence,
+                    result.final_solution.confidence,
+                ),
                 position_suggestion=current_recommendation.position_suggestion,
             )
         else:
@@ -278,7 +384,7 @@ class InvestmentAnalysisService:
         status = "pass"
         if decision.decision.value == "challenge":
             status = "challenge"
-        elif decision.decision.value in {"reject"}:
+        elif decision.decision.value == "reject":
             status = "reject"
 
         return RiskGateResult(
@@ -342,3 +448,7 @@ class InvestmentAnalysisService:
 
         return "\n".join(lines)
 
+    async def _emit(self, event_sink: EventSink, event_type: str, **payload: Any) -> None:
+        if event_sink is None:
+            return
+        await event_sink({"type": event_type, "payload": payload})
