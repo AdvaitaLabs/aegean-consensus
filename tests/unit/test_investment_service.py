@@ -140,3 +140,19 @@ async def test_constraints_cap_exposure_and_block_sell() -> None:
     assert resp.recommendation.position_suggestion["target_exposure_pct"] <= 0.03
     assert resp.recommendation.position_suggestion["max_drawdown_guard_pct"] == 0.02
 
+
+@pytest.mark.asyncio
+async def test_roundtable_still_respects_constraints() -> None:
+    service = _build_service(agent_count=3)
+    req = _build_request(mode=InvestmentMode.ROUNDTABLE, asset_type=AssetType.EQUITY)
+    req.constraints = {
+        "allowed_actions": ["hold"],
+        "max_exposure_pct": 0.01,
+    }
+
+    resp = await service.analyze(req)
+
+    assert resp.consensus.enabled is True
+    assert resp.recommendation.action.value == "hold"
+    assert resp.recommendation.position_suggestion["target_exposure_pct"] <= 0.01
+

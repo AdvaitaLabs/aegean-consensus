@@ -95,6 +95,19 @@ class InvestmentAnalysisService:
         agent_outputs = [self._solution_to_output(sol) for sol in solutions]
 
         recommendation, summary = self._merge_outputs(agent_outputs)
+
+        consensus_view = ConsensusResultView(enabled=False)
+        if request.mode == InvestmentMode.ROUNDTABLE and agents:
+            await self._emit(event_sink, "roundtable_started", request_id=request_id)
+            consensus_view, recommendation = await self._run_roundtable(task, agents, recommendation)
+            await self._emit(
+                event_sink,
+                "roundtable_finished",
+                request_id=request_id,
+                rounds_used=consensus_view.rounds_used,
+                consensus_reached=consensus_view.consensus_reached,
+            )
+
         recommendation = self._apply_constraints(request, recommendation)
         await self._emit(
             event_sink,
@@ -110,18 +123,6 @@ class InvestmentAnalysisService:
             action=recommendation.action.value,
             confidence=recommendation.confidence,
         )
-
-        consensus_view = ConsensusResultView(enabled=False)
-        if request.mode == InvestmentMode.ROUNDTABLE and agents:
-            await self._emit(event_sink, "roundtable_started", request_id=request_id)
-            consensus_view, recommendation = await self._run_roundtable(task, agents, recommendation)
-            await self._emit(
-                event_sink,
-                "roundtable_finished",
-                request_id=request_id,
-                rounds_used=consensus_view.rounds_used,
-                consensus_reached=consensus_view.consensus_reached,
-            )
 
         risk_gate = await self._evaluate_risk(request, recommendation)
         await self._emit(

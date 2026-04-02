@@ -618,6 +618,25 @@ Mode behavior:
 - `collaborate`: more agents, still no consensus rounds
 - `roundtable`: explicit consensus path enabled
 
+Optional `constraints` contract (deterministic gate):
+- `allowed_actions`: string array, e.g. `["hold", "buy"]`
+- `no_short`: boolean, if true then `sell` is forced to `hold`
+- `max_exposure_pct`: number, upper cap for `position_suggestion.target_exposure_pct`
+- `max_drawdown_guard_pct`: number, overwrite `position_suggestion.max_drawdown_guard_pct`
+
+Example:
+
+```json
+{
+  "constraints": {
+    "allowed_actions": ["hold", "buy"],
+    "no_short": true,
+    "max_exposure_pct": 0.03,
+    "max_drawdown_guard_pct": 0.02
+  }
+}
+```
+
 #### `POST /api/v1/investment/analyze/stream`
 
 Run streaming analysis via SSE (`text/event-stream`).
