@@ -1,0 +1,211 @@
+"""Unit tests for investment API handlers and SSE behavior."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List
+
+import pytest
+from fastapi import HTTPException
+
+from aegean.api import investment_api
+from aegean.investment.models import (
+    AssetType,
+    ConsensusResultView,
+    InvestmentAnalysisRequest,
+    InvestmentAnalysisResponse,
+    InvestmentAsset,
+    InvestmentMetadata,
+    InvestmentMode,
+    InvestmentRecommendation,
+    InvestmentSummary,
+    InvestmentTimeframe,
+    MarketCode,
+    RecommendationAction,
+    RiskGateResult,
+)
+
+
+class FakeInvestmentService:
+    def __init__(self, behavior: str = "ok"):
+        self.behavior = behavior
+
+    async def analyze(self, body: InvestmentAnalysisRequest, event_sink=None) -> InvestmentAnalysisResponse:
+        if self.behavior == "value_error":
+            raise ValueError("invalid request")
+        if self.behavior == "runtime_error":
+            raise RuntimeError("unexpected")
+
+        if event_sink is not None:
+            await event_sink(
+                {
+                    "type": "constraints_applied",
+                    "payload": {
+                        "constraints_applied_summary": {
+                            "input_action": "buy",
+                            "output_action": "hold",
+                            "binding_cap": "objective",
+                        }
+                    },
+                }
+            )
+
+        return _build_response(body)
+
+
+@pytest.fixture(autouse=True)
+def _reset_service() -> None:
+    investment_api._service = None
+    yield
+    investment_api._service = None
+
+
+def _build_request(asset_type: AssetType = AssetType.EQUITY) -> InvestmentAnalysisRequest:
+    return InvestmentAnalysisRequest(
+        mode=InvestmentMode.AUTO,
+        asset=InvestmentAsset(symbol="AAPL", market=MarketCode.US, asset_type=asset_type),
+        timeframe=InvestmentTimeframe(horizon="1m"),
+        risk_profile="balanced",
+        objective="balanced",
+        user_id="u-test",
+    )
+
+
+def _build_response(body: InvestmentAnalysisRequest) -> InvestmentAnalysisResponse:
+    if body.asset.asset_type == AssetType.OPTIONS:
+        data_sources = ["public_market_data", "option_chain_feed", "vol_surface_feed"]
+        selected_skills = ["options_greeks", "vol_surface"]
+        task_type = "options_analysis"
+    else:
+        data_sources = ["public_market_data"]
+        selected_skills = ["fundamental_analysis"]
+        task_type = "equity_analysis"
+
+    return InvestmentAnalysisResponse(
+        request_id="inv-test-001",
+        mode=body.mode,
+        asset=body.asset,
+        timeframe=body.timeframe,
+        recommendation=InvestmentRecommendation(
+            action=RecommendationAction.HOLD,
+            confidence=0.8,
+            position_suggestion={"target_exposure_pct": 0.05, "max_drawdown_guard_pct": 0.08},
+        ),
+        summary=InvestmentSummary(
+            thesis="test thesis",
+            key_drivers=["d1"],
+            key_risks=["r1"],
+        ),
+        agent_outputs=[],
+        risk_gate=RiskGateResult(status="pass", risk_level="low", risk_indicators=[]),
+        consensus=ConsensusResultView(enabled=False),
+        report_markdown="# test",
+        metadata=InvestmentMetadata(
+            token_usage={"prompt": 1, "completion": 1, "total": 2},
+            latency_ms=10,
+            data_sources=data_sources,
+            selected_skills=selected_skills,
+            task_type=task_type,
+            constraints_applied_summary={"binding_cap": "objective"},
+        ),
+    )
+
+
+async def _collect_sse_events(stream_response) -> List[Dict[str, Any]]:
+    chunks: List[str] = []
+    async for part in stream_response.body_iterator:
+        chunks.append(part.decode() if isinstance(part, bytes) else part)
+
+    events: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        for raw in chunk.split("\n\n"):
+            raw = raw.strip()
+            if not raw or not raw.startswith("data: "):
+                continue
+            events.append(json.loads(raw[len("data: ") :]))
+    return events
+
+
+@pytest.mark.asyncio
+async def test_analyze_investment_success_returns_response() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.analyze_investment(_build_request())
+
+    assert resp.request_id == "inv-test-001"
+    assert resp.recommendation.action == RecommendationAction.HOLD
+
+
+@pytest.mark.asyncio
+async def test_analyze_investment_value_error_maps_to_400() -> None:
+    investment_api._service = FakeInvestmentService("value_error")
+
+    with pytest.raises(HTTPException) as exc:
+        await investment_api.analyze_investment(_build_request())
+
+    assert exc.value.status_code == 400
+    assert "invalid request" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_analyze_investment_runtime_error_maps_to_500() -> None:
+    investment_api._service = FakeInvestmentService("runtime_error")
+
+    with pytest.raises(HTTPException) as exc:
+        await investment_api.analyze_investment(_build_request())
+
+    assert exc.value.status_code == 500
+    assert "unexpected" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_analyze_stream_success_emits_result_and_end() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    stream_resp = await investment_api.analyze_investment_stream(_build_request())
+    events = await _collect_sse_events(stream_resp)
+    types = [evt["type"] for evt in events]
+
+    assert "constraints_applied" in types
+    assert "result" in types
+    assert types[-1] == "end"
+
+    result_event = next(evt for evt in events if evt["type"] == "result")
+    summary = result_event["payload"]["metadata"]["constraints_applied_summary"]
+    assert summary["binding_cap"] == "objective"
+
+
+@pytest.mark.asyncio
+async def test_analyze_stream_value_error_emits_error_and_end() -> None:
+    investment_api._service = FakeInvestmentService("value_error")
+
+    stream_resp = await investment_api.analyze_investment_stream(_build_request())
+    events = await _collect_sse_events(stream_resp)
+
+    assert events[-1]["type"] == "end"
+    error_event = next(evt for evt in events if evt["type"] == "error")
+    assert error_event["payload"]["code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_analyze_stream_runtime_error_emits_error_and_end() -> None:
+    investment_api._service = FakeInvestmentService("runtime_error")
+
+    stream_resp = await investment_api.analyze_investment_stream(_build_request())
+    events = await _collect_sse_events(stream_resp)
+
+    assert events[-1]["type"] == "end"
+    error_event = next(evt for evt in events if evt["type"] == "error")
+    assert error_event["payload"]["code"] == 500
+
+
+@pytest.mark.asyncio
+async def test_analyze_investment_v3_options_returns_skill_metadata() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.analyze_investment(_build_request(asset_type=AssetType.OPTIONS))
+
+    assert resp.metadata.task_type == "options_analysis"
+    assert "options_greeks" in resp.metadata.selected_skills
+    assert "option_chain_feed" in resp.metadata.data_sources
+
