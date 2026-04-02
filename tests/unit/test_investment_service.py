@@ -117,8 +117,26 @@ async def test_event_sink_receives_progress_events() -> None:
     assert "request_validated" in events
     assert "agents_selected" in events
     assert "agent_completed" in events
+    assert "constraints_applied" in events
     assert "recommendation_ready" in events
     assert "risk_gate_finished" in events
     assert "analysis_completed" in events
     assert "roundtable_started" not in events
+
+
+@pytest.mark.asyncio
+async def test_constraints_cap_exposure_and_block_sell() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+    req.constraints = {
+        "allowed_actions": ["hold", "buy"],
+        "max_exposure_pct": 0.03,
+        "max_drawdown_guard_pct": 0.02,
+    }
+
+    resp = await service.analyze(req)
+
+    assert resp.recommendation.action.value in {"hold", "buy"}
+    assert resp.recommendation.position_suggestion["target_exposure_pct"] <= 0.03
+    assert resp.recommendation.position_suggestion["max_drawdown_guard_pct"] == 0.02
 

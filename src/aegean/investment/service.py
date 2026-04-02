@@ -95,6 +95,14 @@ class InvestmentAnalysisService:
         agent_outputs = [self._solution_to_output(sol) for sol in solutions]
 
         recommendation, summary = self._merge_outputs(agent_outputs)
+        recommendation = self._apply_constraints(request, recommendation)
+        await self._emit(
+            event_sink,
+            "constraints_applied",
+            request_id=request_id,
+            action=recommendation.action.value,
+            target_exposure_pct=recommendation.position_suggestion.get("target_exposure_pct", 0.0),
+        )
         await self._emit(
             event_sink,
             "recommendation_ready",
@@ -302,6 +310,49 @@ class InvestmentAnalysisService:
             key_risks=["market_regime_shift", "event_risk"],
         )
         return rec, summary
+
+    def _apply_constraints(
+        self,
+        request: InvestmentAnalysisRequest,
+        recommendation: InvestmentRecommendation,
+    ) -> InvestmentRecommendation:
+        constraints = request.constraints or {}
+        action = recommendation.action
+        position = dict(recommendation.position_suggestion)
+
+        allowed_actions = constraints.get("allowed_actions")
+        if isinstance(allowed_actions, list) and allowed_actions:
+            allowed = {str(a).lower() for a in allowed_actions}
+            if action.value not in allowed:
+                action = RecommendationAction.HOLD
+
+        if bool(constraints.get("no_short")) and action == RecommendationAction.SELL:
+            action = RecommendationAction.HOLD
+
+        target = float(position.get("target_exposure_pct", 0.0) or 0.0)
+        max_exposure = constraints.get("max_exposure_pct")
+        if max_exposure is not None:
+            cap = float(max_exposure)
+            if cap < 0:
+                cap = 0.0
+            target = min(target, cap)
+
+        if action == RecommendationAction.SELL:
+            target = 0.0
+        if action == RecommendationAction.HOLD:
+            target = min(target, 0.05)
+
+        position["target_exposure_pct"] = max(target, 0.0)
+
+        max_dd = constraints.get("max_drawdown_guard_pct")
+        if max_dd is not None:
+            position["max_drawdown_guard_pct"] = max(float(max_dd), 0.0)
+
+        return InvestmentRecommendation(
+            action=action,
+            confidence=recommendation.confidence,
+            position_suggestion=position,
+        )
 
     async def _run_roundtable(
         self,
