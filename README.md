@@ -546,13 +546,11 @@ POST /api/v1/groups/group-a1b2c3d4/consensus
 
 ---
 
-### Investment Analysis API (V1)
+### Investment Analysis API (V3)
 
-> V1 scope is intentionally limited to:
-> - asset_type: `equity` / `etf` / `index`
+> V3 scope:
+> - asset_type: `equity` / `etf` / `index` / `fund` / `convertible_bond` / `futures` / `options` / `crypto`
 > - market: `CN` / `HK` / `US`
->
-> Requests using `fund` / `convertible_bond` (V2) or `futures` / `options` / `crypto` (V3) will return `400`.
 
 #### `POST /api/v1/investment/analyze`
 
@@ -598,6 +596,29 @@ Content-Type: application/json
       "max_drawdown_guard_pct": 0.08
     }
   },
+  "metadata": {
+    "token_usage": {"prompt": 240, "completion": 96, "total": 336},
+    "latency_ms": 1240,
+    "data_sources": ["public_market_data", "company_fundamentals"],
+    "selected_skills": ["fundamental_analysis", "equity_valuation"],
+    "task_type": "equity_analysis",
+    "constraints_applied_summary": {
+      "input_action": "buy",
+      "output_action": "hold",
+      "input_target_exposure_pct": 0.15,
+      "output_target_exposure_pct": 0.05,
+      "effective_caps": {
+        "model_output": 0.15,
+        "risk_profile": 0.15,
+        "objective": 0.1,
+        "max_exposure_pct": 0.08
+      },
+      "binding_cap": "objective",
+      "triggered_rules": ["allowed_actions", "hold_cap"],
+      "asset_symbol": "AAPL",
+      "asset_type": "equity"
+    }
+  },
   "risk_gate": {
     "status": "pass",
     "risk_level": "low",
@@ -623,6 +644,16 @@ Optional `constraints` contract (deterministic gate):
 - `no_short`: boolean, if true then `sell` is forced to `hold`
 - `max_exposure_pct`: number, upper cap for `position_suggestion.target_exposure_pct`
 - `max_drawdown_guard_pct`: number, overwrite `position_suggestion.max_drawdown_guard_pct`
+- `disallowed_symbols`: string array, force listed symbols to `hold`
+- `disallowed_asset_types`: string array, force listed asset types to `hold`
+- `max_single_position_pct`: number, per-symbol cap
+
+V3 `portfolio_context` contract (deterministic hold/position budget):
+- `current_total_exposure_pct`: number
+- `max_total_exposure_pct`: number (remaining budget becomes extra cap)
+- `max_single_position_pct`: number (portfolio-level single position cap)
+- `disallowed_symbols`: string array
+- `disallowed_asset_types`: string array
 
 Built-in deterministic exposure caps (always applied before `max_exposure_pct`):
 - `risk_profile` cap:
@@ -635,17 +666,58 @@ Built-in deterministic exposure caps (always applied before `max_exposure_pct`):
   - `balanced` -> `0.15`
   - `alpha` -> `0.30`
 
-Final exposure is capped by the most conservative bound among model output, `risk_profile`, `objective`, and optional `constraints.max_exposure_pct`.
+Final exposure is capped by the most conservative bound among model output, `risk_profile`, `objective`, optional `constraints.max_exposure_pct`, optional `constraints.max_single_position_pct`, and V3 `portfolio_context` budgets/caps.
+
+Response metadata now includes `constraints_applied_summary` for frontend rendering, including:
+- `input_action` / `output_action`
+- `input_target_exposure_pct` / `output_target_exposure_pct`
+- `effective_caps` + `binding_cap`
+- `triggered_rules`
+
+V3 skill/data routing metadata:
+- `metadata.task_type`: asset-aligned task type (e.g. `options_analysis`, `crypto_analysis`)
+- `metadata.selected_skills`: skill set selected for this asset type
+- `metadata.data_sources`: asset-specific source set (e.g. option chain / on-chain metrics)
+
+Frontend rendering suggestion (`constraints_applied_summary` -> UI copy):
+- Action rewrite badge:
+  - if `input_action != output_action`, show `Action adjusted: {input_action} -> {output_action}`
+- Exposure cap badge:
+  - show `Final exposure cap by {binding_cap}: {output_target_exposure_pct:.2%}`
+- Rule chips:
+  - render one chip per `triggered_rules` item (e.g. `allowed_actions`, `hold_cap`, `disallowed_symbols`)
+- Cap breakdown table:
+  - render `effective_caps` as key-value rows, highlight `binding_cap`
+- Explanation template:
+  - `{asset_symbol} ({asset_type}) recommendation changed by constraints. Final action={output_action}, target exposure={output_target_exposure_pct:.2%}.`
+
+Suggested rule label mapping for product/frontend:
+- `allowed_actions` -> `Action limited by policy`
+- `no_short` -> `Shorting disabled`
+- `disallowed_symbols` -> `Symbol blocked by policy`
+- `disallowed_asset_types` -> `Asset type blocked by policy`
+- `max_drawdown_guard_pct` -> `Drawdown guard overridden`
+- `hold_cap` -> `Hold action capped`
+- `sell_forces_zero` -> `Sell action forces zero exposure`
 
 Example:
 
 ```json
 {
+  "portfolio_context": {
+    "current_total_exposure_pct": 0.18,
+    "max_total_exposure_pct": 0.20,
+    "max_single_position_pct": 0.04,
+    "disallowed_symbols": ["TSLA"],
+    "disallowed_asset_types": ["convertible_bond"]
+  },
   "constraints": {
     "allowed_actions": ["hold", "buy"],
     "no_short": true,
     "max_exposure_pct": 0.03,
-    "max_drawdown_guard_pct": 0.02
+    "max_drawdown_guard_pct": 0.02,
+    "disallowed_symbols": ["GME"],
+    "max_single_position_pct": 0.05
   }
 }
 ```
