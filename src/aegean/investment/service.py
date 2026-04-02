@@ -48,10 +48,190 @@ _ACTION_BY_SIGNAL = {
     "neutral": RecommendationAction.HOLD,
 }
 
-_V1_ALLOWED_ASSET_TYPES = {AssetType.EQUITY, AssetType.ETF, AssetType.INDEX}
-_V1_ALLOWED_MARKETS = {MarketCode.CN, MarketCode.HK, MarketCode.US}
+_V3_ALLOWED_ASSET_TYPES = {
+    AssetType.EQUITY,
+    AssetType.ETF,
+    AssetType.INDEX,
+    AssetType.FUND,
+    AssetType.CONVERTIBLE_BOND,
+    AssetType.FUTURES,
+    AssetType.OPTIONS,
+    AssetType.CRYPTO,
+}
+_V3_ALLOWED_MARKETS = {MarketCode.CN, MarketCode.HK, MarketCode.US}
 _ALLOWED_RISK_PROFILES = {"conservative", "balanced", "aggressive"}
 _ALLOWED_OBJECTIVES = {"defensive", "income", "balanced", "alpha"}
+
+_ASSET_TASK_TYPE = {
+    AssetType.EQUITY: "equity_analysis",
+    AssetType.ETF: "etf_analysis",
+    AssetType.INDEX: "index_analysis",
+    AssetType.FUND: "fund_analysis",
+    AssetType.CONVERTIBLE_BOND: "convertible_bond_analysis",
+    AssetType.FUTURES: "futures_analysis",
+    AssetType.OPTIONS: "options_analysis",
+    AssetType.CRYPTO: "crypto_analysis",
+}
+
+_ASSET_SKILLS = {
+    AssetType.EQUITY: ["fundamental_analysis", "equity_valuation"],
+    AssetType.ETF: ["index_tracking", "allocation_analysis"],
+    AssetType.INDEX: ["macro_regime", "index_structure"],
+    AssetType.FUND: ["fund_selection", "manager_style"],
+    AssetType.CONVERTIBLE_BOND: ["credit_analysis", "equity_optional_value"],
+    AssetType.FUTURES: ["futures_basis", "margin_risk"],
+    AssetType.OPTIONS: ["options_greeks", "vol_surface"],
+    AssetType.CRYPTO: ["onchain_signal", "liquidity_microstructure"],
+}
+
+_ASSET_DATA_SOURCES = {
+    AssetType.EQUITY: ["public_market_data", "company_fundamentals"],
+    AssetType.ETF: ["public_market_data", "etf_holdings"],
+    AssetType.INDEX: ["public_market_data", "macro_indicators"],
+    AssetType.FUND: ["public_market_data", "fund_nav_feed"],
+    AssetType.CONVERTIBLE_BOND: ["public_market_data", "bond_termsheet_feed"],
+    AssetType.FUTURES: ["public_market_data", "futures_curve_feed", "margin_rules"],
+    AssetType.OPTIONS: ["public_market_data", "option_chain_feed", "vol_surface_feed"],
+    AssetType.CRYPTO: ["public_market_data", "exchange_depth_feed", "onchain_metrics"],
+}
+
+
+def _profile_exposure_cap(risk_profile: str) -> float:
+    profile = (risk_profile or "balanced").lower()
+    caps = {
+        "conservative": 0.05,
+        "balanced": 0.15,
+        "aggressive": 0.30,
+    }
+    return caps.get(profile, 0.15)
+
+
+def _objective_exposure_cap(objective: str) -> float:
+    goal = (objective or "balanced").lower()
+    caps = {
+        "defensive": 0.08,
+        "income": 0.10,
+        "balanced": 0.15,
+        "alpha": 0.30,
+    }
+    return caps.get(goal, 0.15)
+
+
+def _compute_constrained_recommendation(
+    action: RecommendationAction,
+    position_suggestion: Dict[str, float],
+    constraints: Dict[str, Any],
+    risk_profile: str,
+    objective: str,
+    asset_symbol: str,
+    asset_type: AssetType,
+    portfolio_context: Optional[Dict[str, Any]],
+) -> Tuple[RecommendationAction, Dict[str, float], Dict[str, Any]]:
+    """Pure function for final action/exposure computation (V3 constraints-aware)."""
+    next_action = action
+    next_position = dict(position_suggestion)
+    triggered_rules: List[str] = []
+
+    allowed_actions = constraints.get("allowed_actions")
+    if isinstance(allowed_actions, list) and allowed_actions:
+        allowed = {str(a).lower() for a in allowed_actions}
+        if next_action.value not in allowed:
+            next_action = RecommendationAction.HOLD
+            triggered_rules.append("allowed_actions")
+
+    if bool(constraints.get("no_short")) and next_action == RecommendationAction.SELL:
+        next_action = RecommendationAction.HOLD
+        triggered_rules.append("no_short")
+
+    disallowed_symbols = {
+        str(s).upper() for s in (constraints.get("disallowed_symbols") or []) if str(s).strip()
+    }
+    disallowed_asset_types = {
+        str(t).lower() for t in (constraints.get("disallowed_asset_types") or []) if str(t).strip()
+    }
+
+    portfolio = portfolio_context or {}
+    disallowed_symbols.update(
+        str(s).upper()
+        for s in (portfolio.get("disallowed_symbols") or [])
+        if str(s).strip()
+    )
+    disallowed_asset_types.update(
+        str(t).lower()
+        for t in (portfolio.get("disallowed_asset_types") or [])
+        if str(t).strip()
+    )
+
+    if asset_symbol.upper() in disallowed_symbols:
+        next_action = RecommendationAction.HOLD
+        triggered_rules.append("disallowed_symbols")
+
+    if asset_type.value.lower() in disallowed_asset_types:
+        next_action = RecommendationAction.HOLD
+        triggered_rules.append("disallowed_asset_types")
+
+    target = float(next_position.get("target_exposure_pct", 0.0) or 0.0)
+
+    caps = {
+        "model_output": target,
+        "risk_profile": _profile_exposure_cap(risk_profile),
+        "objective": _objective_exposure_cap(objective),
+    }
+
+    max_exposure = constraints.get("max_exposure_pct")
+    if max_exposure is not None:
+        caps["max_exposure_pct"] = max(float(max_exposure), 0.0)
+
+    max_single_from_constraints = constraints.get("max_single_position_pct")
+    if max_single_from_constraints is not None:
+        caps["max_single_position_pct"] = max(float(max_single_from_constraints), 0.0)
+
+    max_single_from_portfolio = portfolio.get("max_single_position_pct")
+    if max_single_from_portfolio is not None:
+        caps["portfolio_max_single_position_pct"] = max(float(max_single_from_portfolio), 0.0)
+
+    current_total_exposure_pct = float(portfolio.get("current_total_exposure_pct", 0.0) or 0.0)
+    max_total_exposure_pct = portfolio.get("max_total_exposure_pct")
+    if max_total_exposure_pct is not None:
+        remaining_budget = max(float(max_total_exposure_pct) - current_total_exposure_pct, 0.0)
+        caps["portfolio_remaining_budget_pct"] = remaining_budget
+
+    target = min(caps.values()) if caps else 0.0
+
+    if next_action == RecommendationAction.SELL:
+        target = 0.0
+        triggered_rules.append("sell_forces_zero")
+    if next_action == RecommendationAction.HOLD:
+        hold_cap = 0.05
+        if target > hold_cap:
+            triggered_rules.append("hold_cap")
+        target = min(target, hold_cap)
+
+    position_before = float(position_suggestion.get("target_exposure_pct", 0.0) or 0.0)
+    next_position["target_exposure_pct"] = max(target, 0.0)
+
+    max_dd = constraints.get("max_drawdown_guard_pct")
+    if max_dd is not None:
+        next_position["max_drawdown_guard_pct"] = max(float(max_dd), 0.0)
+        triggered_rules.append("max_drawdown_guard_pct")
+
+    effective_caps = {k: float(v) for k, v in caps.items()}
+    min_cap = min(effective_caps.values()) if effective_caps else 0.0
+    cap_owner = next((k for k, v in effective_caps.items() if v == min_cap), "none")
+
+    summary = {
+        "input_action": action.value,
+        "output_action": next_action.value,
+        "input_target_exposure_pct": position_before,
+        "output_target_exposure_pct": next_position["target_exposure_pct"],
+        "effective_caps": effective_caps,
+        "binding_cap": cap_owner,
+        "triggered_rules": sorted(set(triggered_rules)),
+        "asset_symbol": asset_symbol,
+        "asset_type": asset_type.value,
+    }
+
+    return next_action, next_position, summary
 
 
 EventSink = Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -79,20 +259,24 @@ class InvestmentAnalysisService:
     ) -> InvestmentAnalysisResponse:
         started = time.time()
         request_id = f"inv-{uuid.uuid4().hex[:12]}"
+        task_type = self._task_type_for_asset(request.asset.asset_type)
+        selected_skills = self._selected_skills_for_asset(request.asset.asset_type)
 
         await self._emit(event_sink, "analysis_started", request_id=request_id, mode=request.mode.value)
         self._validate_request(request)
         await self._emit(event_sink, "request_validated", request_id=request_id)
 
-        agents = self._select_agents(request.mode)
+        agents = self._select_agents(request.mode, task_type)
         await self._emit(
             event_sink,
             "agents_selected",
             request_id=request_id,
             agent_ids=[a.agent_id for a in agents],
+            task_type=task_type,
+            selected_skills=selected_skills,
         )
 
-        task = self._build_task_prompt(request)
+        task = self._build_task_prompt(request, task_type, selected_skills)
         solutions = await self._collect_solutions(agents, task, event_sink, request_id)
         agent_outputs = [self._solution_to_output(sol) for sol in solutions]
 
@@ -110,13 +294,14 @@ class InvestmentAnalysisService:
                 consensus_reached=consensus_view.consensus_reached,
             )
 
-        recommendation = self._apply_constraints(request, recommendation)
+        recommendation, constraints_summary = self._apply_constraints(request, recommendation)
         await self._emit(
             event_sink,
             "constraints_applied",
             request_id=request_id,
             action=recommendation.action.value,
             target_exposure_pct=recommendation.position_suggestion.get("target_exposure_pct", 0.0),
+            constraints_applied_summary=constraints_summary,
         )
         await self._emit(
             event_sink,
@@ -146,7 +331,10 @@ class InvestmentAnalysisService:
         metadata = InvestmentMetadata(
             token_usage=self._aggregate_tokens(solutions),
             latency_ms=int((time.time() - started) * 1000),
-            data_sources=["public_market_data"],
+            data_sources=self._asset_data_sources_for(request.asset.asset_type),
+            selected_skills=selected_skills,
+            task_type=task_type,
+            constraints_applied_summary=constraints_summary,
         )
 
         response = InvestmentAnalysisResponse(
@@ -181,33 +369,34 @@ class InvestmentAnalysisService:
                 "objective must be one of: defensive, income, balanced, alpha"
             )
 
-        if market not in _V1_ALLOWED_MARKETS:
+        if market not in _V3_ALLOWED_MARKETS:
             raise ValueError(
-                f"V1 only supports markets CN/HK/US, got {market.value}."
+                f"Investment API supports markets CN/HK/US, got {market.value}."
             )
-        if asset_type not in _V1_ALLOWED_ASSET_TYPES:
-            if asset_type in {AssetType.FUND, AssetType.CONVERTIBLE_BOND}:
-                raise ValueError(
-                    f"{asset_type.value} is planned for V2. "
-                    "Current V1 supports only equity/etf/index."
-                )
+        if asset_type not in _V3_ALLOWED_ASSET_TYPES:
             raise ValueError(
-                f"{asset_type.value} is planned for V3. "
-                "Current V1 supports only equity/etf/index."
+                "Unsupported asset_type. Current API supports "
+                "equity/etf/index/fund/convertible_bond/futures/options/crypto."
             )
 
-    def _select_agents(self, mode: InvestmentMode) -> List[Agent]:
+    def _select_agents(self, mode: InvestmentMode, task_type: str) -> List[Agent]:
         all_agents = self.agent_registry.get_all_agents()
         if not all_agents:
             return []
 
+        ranked = sorted(
+            all_agents,
+            key=lambda a: a.get_weight_for_task(task_type),
+            reverse=True,
+        )
+
         if mode == InvestmentMode.FAST:
-            return all_agents[:1]
+            return ranked[:1]
         if mode == InvestmentMode.AUTO:
-            return all_agents[:2]
+            return ranked[:2]
         if mode == InvestmentMode.COLLABORATE:
-            return all_agents[: min(4, len(all_agents))]
-        return all_agents[: min(5, len(all_agents))]
+            return ranked[: min(4, len(ranked))]
+        return ranked[: min(5, len(ranked))]
 
     async def _collect_solutions(
         self,
@@ -250,18 +439,38 @@ class InvestmentAnalysisService:
 
         return solutions
 
-    def _build_task_prompt(self, request: InvestmentAnalysisRequest) -> str:
+    def _build_task_prompt(
+        self,
+        request: InvestmentAnalysisRequest,
+        task_type: str,
+        selected_skills: List[str],
+    ) -> str:
         facts = "\n".join(f"- {f}" for f in request.public_facts[:10])
         facts = facts or "- No extra public facts provided"
+        skill_lines = "\n".join(f"- {s}" for s in selected_skills) or "- generic_analysis"
 
         return (
             f"You are an investment analyst. Analyze {request.asset.symbol} "
             f"({request.asset.market.value}, {request.asset.asset_type.value}) with horizon {request.timeframe.horizon}.\n"
+            f"Task type: {task_type}.\n"
             f"Risk profile: {request.risk_profile}. Objective: {request.objective}.\n"
+            f"Required skills:\n{skill_lines}\n"
             f"Market snapshot: {request.market_snapshot or 'N/A'}\n"
             f"Facts:\n{facts}\n"
             "Output concise recommendation with one of BUY/HOLD/SELL/WATCH and key reasons."
         )
+
+    @staticmethod
+    def _task_type_for_asset(asset_type: AssetType) -> str:
+        return _ASSET_TASK_TYPE.get(asset_type, "investment_analysis")
+
+    @staticmethod
+    def _selected_skills_for_asset(asset_type: AssetType) -> List[str]:
+        return _ASSET_SKILLS.get(asset_type, ["general_investment_analysis"])
+
+    @staticmethod
+    def _asset_data_sources_for(asset_type: AssetType) -> List[str]:
+        return _ASSET_DATA_SOURCES.get(asset_type, ["public_market_data"])
 
     def _solution_to_output(self, solution: Solution) -> AgentOutput:
         signal = self._extract_signal(solution.answer)
@@ -330,70 +539,26 @@ class InvestmentAnalysisService:
         self,
         request: InvestmentAnalysisRequest,
         recommendation: InvestmentRecommendation,
-    ) -> InvestmentRecommendation:
-        constraints = request.constraints or {}
-        action = recommendation.action
-        position = dict(recommendation.position_suggestion)
-
-        allowed_actions = constraints.get("allowed_actions")
-        if isinstance(allowed_actions, list) and allowed_actions:
-            allowed = {str(a).lower() for a in allowed_actions}
-            if action.value not in allowed:
-                action = RecommendationAction.HOLD
-
-        if bool(constraints.get("no_short")) and action == RecommendationAction.SELL:
-            action = RecommendationAction.HOLD
-
-        target = float(position.get("target_exposure_pct", 0.0) or 0.0)
-
-        profile_cap = self._profile_exposure_cap(request.risk_profile)
-        objective_cap = self._objective_exposure_cap(request.objective)
-        target = min(target, profile_cap, objective_cap)
-
-        max_exposure = constraints.get("max_exposure_pct")
-        if max_exposure is not None:
-            cap = float(max_exposure)
-            if cap < 0:
-                cap = 0.0
-            target = min(target, cap)
-
-        if action == RecommendationAction.SELL:
-            target = 0.0
-        if action == RecommendationAction.HOLD:
-            target = min(target, 0.05)
-
-        position["target_exposure_pct"] = max(target, 0.0)
-
-        max_dd = constraints.get("max_drawdown_guard_pct")
-        if max_dd is not None:
-            position["max_drawdown_guard_pct"] = max(float(max_dd), 0.0)
-
-        return InvestmentRecommendation(
-            action=action,
-            confidence=recommendation.confidence,
-            position_suggestion=position,
+    ) -> Tuple[InvestmentRecommendation, Dict[str, Any]]:
+        action, position, summary = _compute_constrained_recommendation(
+            action=recommendation.action,
+            position_suggestion=recommendation.position_suggestion,
+            constraints=request.constraints or {},
+            risk_profile=request.risk_profile,
+            objective=request.objective,
+            asset_symbol=request.asset.symbol,
+            asset_type=request.asset.asset_type,
+            portfolio_context=request.portfolio_context,
         )
 
-    @staticmethod
-    def _profile_exposure_cap(risk_profile: str) -> float:
-        profile = (risk_profile or "balanced").lower()
-        caps = {
-            "conservative": 0.05,
-            "balanced": 0.15,
-            "aggressive": 0.30,
-        }
-        return caps.get(profile, 0.15)
-
-    @staticmethod
-    def _objective_exposure_cap(objective: str) -> float:
-        goal = (objective or "balanced").lower()
-        caps = {
-            "defensive": 0.08,
-            "income": 0.10,
-            "balanced": 0.15,
-            "alpha": 0.30,
-        }
-        return caps.get(goal, 0.15)
+        return (
+            InvestmentRecommendation(
+                action=action,
+                confidence=recommendation.confidence,
+                position_suggestion=position,
+            ),
+            summary,
+        )
 
     async def _run_roundtable(
         self,

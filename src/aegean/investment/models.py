@@ -90,6 +90,9 @@ class InvestmentMetadata(BaseModel):
     )
     latency_ms: int = 0
     data_sources: List[str] = Field(default_factory=list)
+    selected_skills: List[str] = Field(default_factory=list)
+    task_type: str = ""
+    constraints_applied_summary: Dict[str, Any] = Field(default_factory=dict)
 
 
 class InvestmentAnalysisRequest(BaseModel):
