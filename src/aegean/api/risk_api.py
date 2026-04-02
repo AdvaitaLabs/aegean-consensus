@@ -44,7 +44,7 @@ def init_risk_service(
     memory_system: Optional[GlobalMemorySystem] = None,
     llm_client: Optional[Any] = None,
     config: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> RiskConsensusCoordinator:
     """Initialize the risk service. Call this once at app startup."""
     global _coordinator, _session_manager, _challenge_manager, _memory_system
 
@@ -60,6 +60,7 @@ def init_risk_service(
     # Share session/challenge managers with coordinator
     _coordinator.session_manager = _session_manager
     _coordinator.challenge_manager = _challenge_manager
+    return _coordinator
 
 
 def _get_coordinator() -> RiskConsensusCoordinator:
