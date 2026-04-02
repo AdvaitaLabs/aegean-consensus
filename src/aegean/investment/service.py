@@ -331,6 +331,11 @@ class InvestmentAnalysisService:
             action = RecommendationAction.HOLD
 
         target = float(position.get("target_exposure_pct", 0.0) or 0.0)
+
+        profile_cap = self._profile_exposure_cap(request.risk_profile)
+        objective_cap = self._objective_exposure_cap(request.objective)
+        target = min(target, profile_cap, objective_cap)
+
         max_exposure = constraints.get("max_exposure_pct")
         if max_exposure is not None:
             cap = float(max_exposure)
@@ -354,6 +359,27 @@ class InvestmentAnalysisService:
             confidence=recommendation.confidence,
             position_suggestion=position,
         )
+
+    @staticmethod
+    def _profile_exposure_cap(risk_profile: str) -> float:
+        profile = (risk_profile or "balanced").lower()
+        caps = {
+            "conservative": 0.05,
+            "balanced": 0.15,
+            "aggressive": 0.30,
+        }
+        return caps.get(profile, 0.15)
+
+    @staticmethod
+    def _objective_exposure_cap(objective: str) -> float:
+        goal = (objective or "balanced").lower()
+        caps = {
+            "defensive": 0.08,
+            "income": 0.10,
+            "balanced": 0.15,
+            "alpha": 0.30,
+        }
+        return caps.get(goal, 0.15)
 
     async def _run_roundtable(
         self,

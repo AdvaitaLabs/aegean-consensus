@@ -156,3 +156,15 @@ async def test_roundtable_still_respects_constraints() -> None:
     assert resp.recommendation.action.value == "hold"
     assert resp.recommendation.position_suggestion["target_exposure_pct"] <= 0.01
 
+
+@pytest.mark.asyncio
+async def test_conservative_profile_and_defensive_objective_cap_exposure() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+    req.risk_profile = "conservative"
+    req.objective = "defensive"
+
+    resp = await service.analyze(req)
+
+    assert resp.recommendation.position_suggestion["target_exposure_pct"] <= 0.05
+
