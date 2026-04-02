@@ -546,6 +546,111 @@ POST /api/v1/groups/group-a1b2c3d4/consensus
 
 ---
 
+### Investment Analysis API (V1)
+
+> V1 scope is intentionally limited to:
+> - asset_type: `equity` / `etf` / `index`
+> - market: `CN` / `HK` / `US`
+>
+> Requests using `fund` / `convertible_bond` (V2) or `futures` / `options` / `crypto` (V3) will return `400`.
+
+#### `POST /api/v1/investment/analyze`
+
+Run non-streaming investment analysis.
+
+```http
+POST /api/v1/investment/analyze
+Content-Type: application/json
+
+{
+  "mode": "auto",
+  "asset": {
+    "symbol": "AAPL",
+    "market": "US",
+    "asset_type": "equity"
+  },
+  "timeframe": {
+    "analysis_date": "2026-04-03T00:00:00Z",
+    "lookback_window_days": 90,
+    "horizon": "1m"
+  },
+  "risk_profile": "balanced",
+  "objective": "balanced",
+  "public_facts": [
+    "Revenue growth remains stable",
+    "Valuation above 5-year median"
+  ],
+  "custom_question": "Should I increase position this month?",
+  "user_id": "user_123"
+}
+```
+
+```json
+{
+  "request_id": "inv-abc123def456",
+  "mode": "auto",
+  "asset": {"symbol": "AAPL", "market": "US", "asset_type": "equity"},
+  "recommendation": {
+    "action": "hold",
+    "confidence": 0.67,
+    "position_suggestion": {
+      "target_exposure_pct": 0.05,
+      "max_drawdown_guard_pct": 0.08
+    }
+  },
+  "risk_gate": {
+    "status": "pass",
+    "risk_level": "low",
+    "risk_indicators": []
+  },
+  "consensus": {
+    "enabled": false,
+    "rounds_used": 0,
+    "consensus_reached": false,
+    "weighted_votes": {}
+  }
+}
+```
+
+Mode behavior:
+- `fast`: single-agent fast response
+- `auto`: multi-agent default; **does not auto-upgrade to roundtable**
+- `collaborate`: more agents, still no consensus rounds
+- `roundtable`: explicit consensus path enabled
+
+#### `POST /api/v1/investment/analyze/stream`
+
+Run streaming analysis via SSE (`text/event-stream`).
+
+Typical event sequence:
+- `analysis_started`
+- `request_validated`
+- `agents_selected`
+- `agent_completed` (repeated)
+- `recommendation_ready`
+- `roundtable_started` / `roundtable_finished` (roundtable only)
+- `risk_gate_finished`
+- `result`
+- `end`
+
+Example:
+
+```bash
+curl -N -X POST "http://localhost:8000/api/v1/investment/analyze/stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "auto",
+    "asset": {"symbol": "AAPL", "market": "US", "asset_type": "equity"},
+    "timeframe": {"analysis_date": "2026-04-03T00:00:00Z", "lookback_window_days": 90, "horizon": "1m"},
+    "risk_profile": "balanced",
+    "objective": "balanced",
+    "public_facts": ["Revenue growth remains stable"],
+    "user_id": "user_123"
+  }'
+```
+
+---
+
 ### Risk Assessment API
 
 #### `POST /api/v1/risk/evaluate`
