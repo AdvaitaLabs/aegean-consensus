@@ -624,6 +624,19 @@ Optional `constraints` contract (deterministic gate):
 - `max_exposure_pct`: number, upper cap for `position_suggestion.target_exposure_pct`
 - `max_drawdown_guard_pct`: number, overwrite `position_suggestion.max_drawdown_guard_pct`
 
+Built-in deterministic exposure caps (always applied before `max_exposure_pct`):
+- `risk_profile` cap:
+  - `conservative` -> `0.05`
+  - `balanced` -> `0.15`
+  - `aggressive` -> `0.30`
+- `objective` cap:
+  - `defensive` -> `0.08`
+  - `income` -> `0.10`
+  - `balanced` -> `0.15`
+  - `alpha` -> `0.30`
+
+Final exposure is capped by the most conservative bound among model output, `risk_profile`, `objective`, and optional `constraints.max_exposure_pct`.
+
 Example:
 
 ```json
@@ -646,8 +659,9 @@ Typical event sequence:
 - `request_validated`
 - `agents_selected`
 - `agent_completed` (repeated)
-- `recommendation_ready`
 - `roundtable_started` / `roundtable_finished` (roundtable only)
+- `constraints_applied`
+- `recommendation_ready`
 - `risk_gate_finished`
 - `result`
 - `end`

@@ -50,6 +50,8 @@ _ACTION_BY_SIGNAL = {
 
 _V1_ALLOWED_ASSET_TYPES = {AssetType.EQUITY, AssetType.ETF, AssetType.INDEX}
 _V1_ALLOWED_MARKETS = {MarketCode.CN, MarketCode.HK, MarketCode.US}
+_ALLOWED_RISK_PROFILES = {"conservative", "balanced", "aggressive"}
+_ALLOWED_OBJECTIVES = {"defensive", "income", "balanced", "alpha"}
 
 
 EventSink = Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -166,6 +168,18 @@ class InvestmentAnalysisService:
     def _validate_request(self, request: InvestmentAnalysisRequest) -> None:
         asset_type = request.asset.asset_type
         market = request.asset.market
+
+        risk_profile = (request.risk_profile or "balanced").lower()
+        if risk_profile not in _ALLOWED_RISK_PROFILES:
+            raise ValueError(
+                "risk_profile must be one of: conservative, balanced, aggressive"
+            )
+
+        objective = (request.objective or "balanced").lower()
+        if objective not in _ALLOWED_OBJECTIVES:
+            raise ValueError(
+                "objective must be one of: defensive, income, balanced, alpha"
+            )
 
         if market not in _V1_ALLOWED_MARKETS:
             raise ValueError(

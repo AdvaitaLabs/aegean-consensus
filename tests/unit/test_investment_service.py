@@ -168,3 +168,23 @@ async def test_conservative_profile_and_defensive_objective_cap_exposure() -> No
 
     assert resp.recommendation.position_suggestion["target_exposure_pct"] <= 0.05
 
+
+@pytest.mark.asyncio
+async def test_invalid_risk_profile_rejected() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+    req.risk_profile = "ultra_safe"
+
+    with pytest.raises(ValueError, match="risk_profile must be one of"):
+        await service.analyze(req)
+
+
+@pytest.mark.asyncio
+async def test_invalid_objective_rejected() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+    req.objective = "hyper_growth"
+
+    with pytest.raises(ValueError, match="objective must be one of"):
+        await service.analyze(req)
+
