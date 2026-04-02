@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import asyncio
+import json
+from typing import Any, AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from aegean.core.agent import AgentRegistry
 from aegean.investment.models import InvestmentAnalysisRequest, InvestmentAnalysisResponse
@@ -38,6 +41,10 @@ def _get_service() -> InvestmentAnalysisService:
     return _service
 
 
+def _to_sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\\n\\n"
+
+
 @router.post(
     "/analyze",
     response_model=InvestmentAnalysisResponse,
@@ -47,6 +54,51 @@ async def analyze_investment(body: InvestmentAnalysisRequest) -> InvestmentAnaly
     service = _get_service()
     try:
         return await service.analyze(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+
+@router.post(
+    "/analyze/stream",
+    summary="Run investment analysis with SSE progress events",
+)
+async def analyze_investment_stream(body: InvestmentAnalysisRequest) -> StreamingResponse:
+    service = _get_service()
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        queue: asyncio.Queue = asyncio.Queue()
+        done = asyncio.Event()
+
+        async def emit(event: dict) -> None:
+            await queue.put(event)
+
+        async def run_analysis() -> None:
+            try:
+                result = await service.analyze(body, event_sink=emit)
+                await queue.put({
+                    "type": "result",
+                    "payload": result.model_dump(mode="json"),
+                })
+            except ValueError as exc:
+                await queue.put({"type": "error", "payload": {"code": 400, "message": str(exc)}})
+            except Exception as exc:
+                await queue.put({"type": "error", "payload": {"code": 500, "message": str(exc)}})
+            finally:
+                done.set()
+
+        asyncio.create_task(run_analysis())
+
+        while True:
+            if done.is_set() and queue.empty():
+                break
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.25)
+                yield _to_sse(event)
+            except asyncio.TimeoutError:
+                continue
+
+        yield _to_sse({"type": "end", "payload": {"message": "stream_closed"}})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
