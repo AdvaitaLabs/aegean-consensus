@@ -9,6 +9,8 @@ from aegean.core.agent import AgentRegistry
 from aegean.api import group_chat_api
 from aegean.api import risk_api
 from aegean.api import investment_api
+from aegean.api import setu_api
+from aegean.services.setu_service import SetuService, build_setu_config_from_env
 
 
 def create_app(
@@ -53,6 +55,13 @@ def create_app(
     
     # Initialize GroupChatService
     group_chat_api.init_service(agent_registry, storage_backend)
+
+    # Initialize Setu adapter service bound to its dedicated group
+    setu_service = SetuService(
+        group_service=group_chat_api.get_service(),
+        config=build_setu_config_from_env(),
+    )
+    setu_api.init_setu_service(setu_service)
     
     # Initialize risk service
     risk_coordinator = risk_api.init_risk_service(
@@ -70,6 +79,7 @@ def create_app(
 
     # Include routers
     app.include_router(group_chat_api.router)
+    app.include_router(setu_api.router)
     app.include_router(risk_api.router)
     app.include_router(investment_api.router)
     
