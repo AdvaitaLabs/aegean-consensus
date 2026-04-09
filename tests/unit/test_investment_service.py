@@ -224,6 +224,39 @@ async def test_roundtable_still_respects_constraints() -> None:
 
 
 @pytest.mark.asyncio
+async def test_roundtable_started_event_sets_run_status_to_roundtable() -> None:
+    service = _build_service(agent_count=3)
+    req = _build_request(mode=InvestmentMode.ROUNDTABLE, asset_type=AssetType.EQUITY)
+
+    statuses: List[str] = []
+
+    async def sink(evt):
+        if evt["type"] == "roundtable_started":
+            run = service.get_analysis_run(evt["request_id"])
+            statuses.append(run["status"])
+
+    await service.analyze(req, event_sink=sink)
+
+    assert statuses == ["roundtable"]
+
+
+@pytest.mark.asyncio
+async def test_risk_gate_started_emits_before_risk_gate_finished() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+
+    events = []
+
+    async def sink(evt):
+        events.append(evt)
+
+    await service.analyze(req, event_sink=sink)
+
+    event_types = [evt["type"] for evt in events]
+    assert event_types.index("risk_gate_started") < event_types.index("risk_gate_finished")
+
+
+@pytest.mark.asyncio
 async def test_metadata_contains_constraints_applied_summary() -> None:
     service = _build_service(agent_count=2)
     req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)

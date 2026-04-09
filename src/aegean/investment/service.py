@@ -395,8 +395,8 @@ class InvestmentAnalysisService:
             confidence=recommendation.confidence,
         )
 
-        risk_gate = await self._evaluate_risk(request, recommendation)
         await emit("risk_gate_started")
+        risk_gate = await self._evaluate_risk(request, recommendation)
         await emit(
             "risk_gate_finished",
             status=risk_gate.status,
@@ -1099,7 +1099,7 @@ class InvestmentAnalysisService:
             run["status"] = "running"
         elif event_type == "analysis_completed":
             run["status"] = "completed"
-        elif event_type == "round_started":
+        elif event_type == "roundtable_started":
             run["status"] = "roundtable"
         elif event_type == "constraints_applied":
             run["policy_overrides"] = payload.get("constraints_applied_summary", {})
