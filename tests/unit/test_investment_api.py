@@ -10,8 +10,11 @@ from fastapi import HTTPException
 
 from aegean.api import investment_api
 from aegean.investment.models import (
+    AnalysisFramework,
     AssetType,
     ConsensusResultView,
+    ConsensusTrace,
+    DisagreementSummary,
     InvestmentAnalysisRequest,
     InvestmentAnalysisResponse,
     InvestmentAsset,
@@ -21,6 +24,7 @@ from aegean.investment.models import (
     InvestmentSummary,
     InvestmentTimeframe,
     MarketCode,
+    PolicyOverrides,
     RecommendationAction,
     RiskGateResult,
 )
@@ -83,22 +87,37 @@ def _build_response(body: InvestmentAnalysisRequest) -> InvestmentAnalysisRespon
 
     return InvestmentAnalysisResponse(
         request_id="inv-test-001",
+        status="completed",
         mode=body.mode,
         asset=body.asset,
         timeframe=body.timeframe,
+        analysis_framework=AnalysisFramework(
+            task_type=task_type,
+            selected_skills=selected_skills,
+            data_sources=data_sources,
+            why_selected=["Detected task type"],
+        ),
         recommendation=InvestmentRecommendation(
             action=RecommendationAction.HOLD,
             confidence=0.8,
             position_suggestion={"target_exposure_pct": 0.05, "max_drawdown_guard_pct": 0.08},
+            decision_rationale="valuation and risk are balanced",
         ),
         summary=InvestmentSummary(
             thesis="test thesis",
             key_drivers=["d1"],
             key_risks=["r1"],
         ),
+        bull_case=["driver"],
+        bear_case=["risk"],
+        catalysts=[],
+        scenario_analysis=[],
         agent_outputs=[],
+        disagreement_summary=DisagreementSummary(main_conflict="valuation vs momentum"),
         risk_gate=RiskGateResult(status="pass", risk_level="low", risk_indicators=[]),
         consensus=ConsensusResultView(enabled=False),
+        consensus_trace=ConsensusTrace(discussion_enabled=False),
+        policy_overrides=PolicyOverrides(binding_cap="objective"),
         report_markdown="# test",
         metadata=InvestmentMetadata(
             token_usage={"prompt": 1, "completion": 1, "total": 2},
@@ -107,6 +126,7 @@ def _build_response(body: InvestmentAnalysisRequest) -> InvestmentAnalysisRespon
             selected_skills=selected_skills,
             task_type=task_type,
             constraints_applied_summary={"binding_cap": "objective"},
+            schema_version="investment_analysis.v2",
         ),
     )
 
@@ -134,6 +154,7 @@ async def test_analyze_investment_success_returns_response() -> None:
 
     assert resp.request_id == "inv-test-001"
     assert resp.recommendation.action == RecommendationAction.HOLD
+    assert resp.analysis_framework.task_type == "equity_analysis"
 
 
 @pytest.mark.asyncio
@@ -208,4 +229,3 @@ async def test_analyze_investment_v3_options_returns_skill_metadata() -> None:
     assert resp.metadata.task_type == "options_analysis"
     assert "options_greeks" in resp.metadata.selected_skills
     assert "option_chain_feed" in resp.metadata.data_sources
-

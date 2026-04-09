@@ -99,6 +99,8 @@ async def test_roundtable_mode_enables_consensus() -> None:
 
     assert resp.mode == InvestmentMode.ROUNDTABLE
     assert resp.consensus.enabled is True
+    assert resp.consensus_trace.discussion_enabled is True
+    assert len(resp.consensus_trace.rounds) == 2
 
 
 @pytest.mark.asyncio
@@ -134,6 +136,7 @@ async def test_event_sink_receives_progress_events_with_constraints_summary() ->
     assert "analysis_started" in event_types
     assert "request_validated" in event_types
     assert "agents_selected" in event_types
+    assert "agent_started" in event_types
     assert "agent_completed" in event_types
     assert "constraints_applied" in event_types
     assert "recommendation_ready" in event_types
@@ -159,6 +162,7 @@ async def test_v3_metadata_contains_task_skills_and_data_sources() -> None:
     assert resp.metadata.task_type == "options_analysis"
     assert "options_greeks" in resp.metadata.selected_skills
     assert "option_chain_feed" in resp.metadata.data_sources
+    assert resp.analysis_framework.task_type == "options_analysis"
 
 
 @pytest.mark.asyncio
@@ -230,6 +234,36 @@ async def test_metadata_contains_constraints_applied_summary() -> None:
     summary = resp.metadata.constraints_applied_summary
     assert summary["output_target_exposure_pct"] <= 0.03
     assert summary["binding_cap"] in summary["effective_caps"]
+    assert resp.policy_overrides.binding_cap == summary["binding_cap"]
+
+
+@pytest.mark.asyncio
+async def test_response_contains_product_ready_sections() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+
+    resp = await service.analyze(req)
+
+    assert resp.status == "completed"
+    assert resp.analysis_framework.style == "multi_agent_investment_review"
+    assert isinstance(resp.bull_case, list)
+    assert isinstance(resp.bear_case, list)
+    assert isinstance(resp.catalysts, list)
+    assert isinstance(resp.scenario_analysis, list)
+    assert resp.metadata.schema_version == "investment_analysis.v2"
+
+
+@pytest.mark.asyncio
+async def test_agent_outputs_include_role_title_and_summary() -> None:
+    service = _build_service(agent_count=2)
+    req = _build_request(mode=InvestmentMode.AUTO, asset_type=AssetType.EQUITY)
+
+    resp = await service.analyze(req)
+
+    output = resp.agent_outputs[0]
+    assert output.role == "fundamental_specialist"
+    assert output.title
+    assert output.summary
 
 
 @pytest.mark.asyncio

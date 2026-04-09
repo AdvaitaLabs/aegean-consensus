@@ -6,6 +6,7 @@ import asyncio
 import time
 import uuid
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from aegean.core.agent import Agent, AgentRegistry
@@ -14,8 +15,14 @@ from aegean.core.decision_engine import WeightedDecisionEngine
 from aegean.core.models import ConsensusConfig, Solution
 from aegean.investment.models import (
     AgentOutput,
+    AnalysisFramework,
     AssetType,
+    CatalystItem,
     ConsensusResultView,
+    ConsensusTrace,
+    DisagreementSummary,
+    DiscussionAgentEntry,
+    DiscussionRound,
     InvestmentAnalysisRequest,
     InvestmentAnalysisResponse,
     InvestmentMetadata,
@@ -23,8 +30,10 @@ from aegean.investment.models import (
     InvestmentRecommendation,
     InvestmentSummary,
     MarketCode,
+    PolicyOverrides,
     RecommendationAction,
     RiskGateResult,
+    ScenarioItem,
 )
 from aegean.risk.models import RiskContext, RiskRequest, RiskSubject
 from aegean.risk.risk_consensus import RiskConsensusCoordinator
@@ -46,6 +55,35 @@ _ACTION_BY_SIGNAL = {
     "bullish": RecommendationAction.BUY,
     "bearish": RecommendationAction.SELL,
     "neutral": RecommendationAction.HOLD,
+}
+
+_SIGNAL_TO_STANCE = {
+    "bullish": "support",
+    "bearish": "oppose",
+    "neutral": "review",
+}
+
+_ROLE_BY_TASK_TYPE = {
+    "equity_analysis": "fundamental_specialist",
+    "etf_analysis": "allocation_specialist",
+    "index_analysis": "macro_specialist",
+    "fund_analysis": "fund_specialist",
+    "convertible_bond_analysis": "convertible_bond_specialist",
+    "futures_analysis": "futures_specialist",
+    "options_analysis": "options_specialist",
+    "crypto_analysis": "crypto_specialist",
+}
+
+_TITLE_BY_ROLE = {
+    "fundamental_specialist": "Fundamental Analysis Agent",
+    "allocation_specialist": "Allocation Analysis Agent",
+    "macro_specialist": "Macro Analysis Agent",
+    "fund_specialist": "Fund Selection Agent",
+    "convertible_bond_specialist": "Convertible Bond Agent",
+    "futures_specialist": "Futures Analysis Agent",
+    "options_specialist": "Options Analysis Agent",
+    "crypto_specialist": "Crypto Analysis Agent",
+    "risk_specialist": "Risk Review Agent",
 }
 
 _V3_ALLOWED_ASSET_TYPES = {
@@ -94,6 +132,10 @@ _ASSET_DATA_SOURCES = {
     AssetType.OPTIONS: ["public_market_data", "option_chain_feed", "vol_surface_feed"],
     AssetType.CRYPTO: ["public_market_data", "exchange_depth_feed", "onchain_metrics"],
 }
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _profile_exposure_cap(risk_profile: str) -> float:
@@ -258,17 +300,26 @@ class InvestmentAnalysisService:
         event_sink: EventSink = None,
     ) -> InvestmentAnalysisResponse:
         started = time.time()
+        created_at = _utc_now()
+        event_count = 0
+
+        async def emit(event_type: str, **payload: Any) -> None:
+            nonlocal event_count
+            event_count += 1
+            await self._emit(event_sink, event_type, **payload)
+
         request_id = f"inv-{uuid.uuid4().hex[:12]}"
         task_type = self._task_type_for_asset(request.asset.asset_type)
         selected_skills = self._selected_skills_for_asset(request.asset.asset_type)
+        data_sources = self._asset_data_sources_for(request.asset.asset_type)
 
-        await self._emit(event_sink, "analysis_started", request_id=request_id, mode=request.mode.value)
+        await emit("analysis_started", request_id=request_id, mode=request.mode.value)
         self._validate_request(request)
-        await self._emit(event_sink, "request_validated", request_id=request_id)
+        await emit("request_validated", request_id=request_id)
 
         agents = self._select_agents(request.mode, task_type)
-        await self._emit(
-            event_sink,
+        analysis_framework = self._build_analysis_framework(request.mode, task_type, selected_skills, data_sources)
+        await emit(
             "agents_selected",
             request_id=request_id,
             agent_ids=[a.agent_id for a in agents],
@@ -277,17 +328,26 @@ class InvestmentAnalysisService:
         )
 
         task = self._build_task_prompt(request, task_type, selected_skills)
-        solutions = await self._collect_solutions(agents, task, event_sink, request_id)
-        agent_outputs = [self._solution_to_output(sol) for sol in solutions]
+        solutions = await self._collect_solutions(agents, task, emit, request_id, task_type)
+        agent_outputs = [self._solution_to_output(sol, task_type) for sol in solutions]
 
         recommendation, summary = self._merge_outputs(agent_outputs)
+        bull_case, bear_case = self._build_bull_bear_cases(summary, agent_outputs)
+        catalysts = self._build_catalysts(request)
+        scenarios = self._build_scenarios(recommendation)
+        disagreement_summary = self._build_disagreement_summary(summary, agent_outputs)
 
         consensus_view = ConsensusResultView(enabled=False)
+        consensus_trace = ConsensusTrace(discussion_enabled=False)
         if request.mode == InvestmentMode.ROUNDTABLE and agents:
-            await self._emit(event_sink, "roundtable_started", request_id=request_id)
-            consensus_view, recommendation = await self._run_roundtable(task, agents, recommendation)
-            await self._emit(
-                event_sink,
+            await emit("roundtable_started", request_id=request_id)
+            consensus_view, recommendation, consensus_trace = await self._run_roundtable(
+                task,
+                agents,
+                recommendation,
+                agent_outputs,
+            )
+            await emit(
                 "roundtable_finished",
                 request_id=request_id,
                 rounds_used=consensus_view.rounds_used,
@@ -295,16 +355,15 @@ class InvestmentAnalysisService:
             )
 
         recommendation, constraints_summary = self._apply_constraints(request, recommendation)
-        await self._emit(
-            event_sink,
+        policy_overrides = self._build_policy_overrides(constraints_summary)
+        await emit(
             "constraints_applied",
             request_id=request_id,
             action=recommendation.action.value,
             target_exposure_pct=recommendation.position_suggestion.get("target_exposure_pct", 0.0),
             constraints_applied_summary=constraints_summary,
         )
-        await self._emit(
-            event_sink,
+        await emit(
             "recommendation_ready",
             request_id=request_id,
             action=recommendation.action.value,
@@ -312,8 +371,7 @@ class InvestmentAnalysisService:
         )
 
         risk_gate = await self._evaluate_risk(request, recommendation)
-        await self._emit(
-            event_sink,
+        await emit(
             "risk_gate_finished",
             request_id=request_id,
             status=risk_gate.status,
@@ -328,29 +386,49 @@ class InvestmentAnalysisService:
             consensus_view,
             risk_gate,
         )
+        completed_at = _utc_now()
         metadata = InvestmentMetadata(
             token_usage=self._aggregate_tokens(solutions),
             latency_ms=int((time.time() - started) * 1000),
-            data_sources=self._asset_data_sources_for(request.asset.asset_type),
+            data_sources=data_sources,
             selected_skills=selected_skills,
             task_type=task_type,
             constraints_applied_summary=constraints_summary,
+            created_at=created_at,
+            completed_at=completed_at,
+            event_count=event_count,
+            schema_version="investment_analysis.v2",
+            debug_flags={
+                "used_roundtable": consensus_view.enabled,
+                "used_constraints": bool(request.constraints or request.portfolio_context),
+                "used_risk_gate": True,
+                "used_external_news": False,
+            },
         )
 
         response = InvestmentAnalysisResponse(
             request_id=request_id,
+            status="completed",
             mode=request.mode,
             asset=request.asset,
             timeframe=request.timeframe,
+            analysis_framework=analysis_framework,
             recommendation=recommendation,
             summary=summary,
+            bull_case=bull_case,
+            bear_case=bear_case,
+            catalysts=catalysts,
+            scenario_analysis=scenarios,
             agent_outputs=agent_outputs,
+            disagreement_summary=disagreement_summary,
             risk_gate=risk_gate,
             consensus=consensus_view,
+            consensus_trace=consensus_trace,
+            policy_overrides=policy_overrides,
             report_markdown=report_md,
             metadata=metadata,
         )
-        await self._emit(event_sink, "analysis_completed", request_id=request_id)
+        await emit("analysis_completed", request_id=request_id)
         return response
 
     def _validate_request(self, request: InvestmentAnalysisRequest) -> None:
@@ -402,8 +480,9 @@ class InvestmentAnalysisService:
         self,
         agents: List[Agent],
         task: str,
-        event_sink: EventSink,
+        emit: Callable[..., Awaitable[None]],
         request_id: str,
+        task_type: str,
     ) -> List[Solution]:
         if not agents:
             return []
@@ -418,6 +497,14 @@ class InvestmentAnalysisService:
         tasks = [asyncio.create_task(_run(agent)) for agent in agents]
         solutions: List[Solution] = []
 
+        for agent in agents:
+            await emit(
+                "agent_started",
+                request_id=request_id,
+                agent_id=agent.agent_id,
+                role=self._role_for_task_type(task_type),
+            )
+
         for done_task in asyncio.as_completed(tasks):
             agent, result = await done_task
             if isinstance(result, Exception):
@@ -429,12 +516,14 @@ class InvestmentAnalysisService:
             else:
                 solution = result
             solutions.append(solution)
-            await self._emit(
-                event_sink,
+            signal = self._extract_signal(solution.answer)
+            await emit(
                 "agent_completed",
                 request_id=request_id,
                 agent_id=solution.agent_id,
                 confidence=solution.confidence,
+                signal=signal,
+                summary=self._summary_from_answer(solution.answer),
             )
 
         return solutions
@@ -472,14 +561,24 @@ class InvestmentAnalysisService:
     def _asset_data_sources_for(asset_type: AssetType) -> List[str]:
         return _ASSET_DATA_SOURCES.get(asset_type, ["public_market_data"])
 
-    def _solution_to_output(self, solution: Solution) -> AgentOutput:
+    @staticmethod
+    def _role_for_task_type(task_type: str) -> str:
+        return _ROLE_BY_TASK_TYPE.get(task_type, "investment_specialist")
+
+    def _solution_to_output(self, solution: Solution, task_type: str) -> AgentOutput:
         signal = self._extract_signal(solution.answer)
         evidence = [ln.strip() for ln in solution.answer.split("\n") if ln.strip()][:3]
+        role = self._role_for_task_type(task_type)
         return AgentOutput(
             agent_id=solution.agent_id,
+            role=role,
+            title=_TITLE_BY_ROLE.get(role, "Investment Analysis Agent"),
             signal=signal,
+            stance=_SIGNAL_TO_STANCE.get(signal, "review"),
             confidence=max(0.0, min(solution.confidence, 1.0)),
+            summary=self._summary_from_answer(solution.answer),
             evidence=evidence,
+            risks_flagged=self._extract_risks(solution.answer),
         )
 
     def _extract_signal(self, text: str) -> str:
@@ -489,12 +588,27 @@ class InvestmentAnalysisService:
                 return mapped
         return "neutral"
 
+    @staticmethod
+    def _summary_from_answer(text: str) -> str:
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        return lines[0] if lines else "No summary provided."
+
+    @staticmethod
+    def _extract_risks(text: str) -> List[str]:
+        lower = text.lower()
+        risks = []
+        for key in ["valuation", "volatility", "liquidity", "macro", "event"]:
+            if key in lower:
+                risks.append(f"{key}_risk")
+        return risks[:3]
+
     def _merge_outputs(self, outputs: List[AgentOutput]) -> Tuple[InvestmentRecommendation, InvestmentSummary]:
         if not outputs:
             rec = InvestmentRecommendation(
                 action=RecommendationAction.WATCH,
                 confidence=0.3,
                 position_suggestion={"target_exposure_pct": 0.0, "max_drawdown_guard_pct": 0.08},
+                decision_rationale="Insufficient agent outputs, fallback to watch.",
             )
             summary = InvestmentSummary(
                 thesis="Insufficient agent outputs, fallback to watch.",
@@ -520,6 +634,7 @@ class InvestmentAnalysisService:
             else 0.0
         )
 
+        rationale = self._build_decision_rationale(outputs, top_signal)
         rec = InvestmentRecommendation(
             action=action,
             confidence=round(confidence, 4),
@@ -527,13 +642,19 @@ class InvestmentAnalysisService:
                 "target_exposure_pct": exposure,
                 "max_drawdown_guard_pct": 0.08,
             },
+            decision_rationale=rationale,
         )
         summary = InvestmentSummary(
             thesis=f"Overall agent sentiment is {top_signal}.",
-            key_drivers=[f"{o.agent_id}:{o.signal}" for o in outputs[:4]],
-            key_risks=["market_regime_shift", "event_risk"],
+            key_drivers=[o.summary for o in outputs[:3]],
+            key_risks=[risk for o in outputs for risk in o.risks_flagged][:3] or ["market_regime_shift", "event_risk"],
         )
         return rec, summary
+
+    @staticmethod
+    def _build_decision_rationale(outputs: List[AgentOutput], top_signal: str) -> str:
+        lead_ids = ", ".join(o.agent_id for o in outputs[:2])
+        return f"Top signal is {top_signal}, supported by {lead_ids}."
 
     def _apply_constraints(
         self,
@@ -556,6 +677,7 @@ class InvestmentAnalysisService:
                 action=action,
                 confidence=recommendation.confidence,
                 position_suggestion=position,
+                decision_rationale=recommendation.decision_rationale,
             ),
             summary,
         )
@@ -565,7 +687,8 @@ class InvestmentAnalysisService:
         task: str,
         agents: List[Agent],
         current_recommendation: InvestmentRecommendation,
-    ) -> Tuple[ConsensusResultView, InvestmentRecommendation]:
+        agent_outputs: List[AgentOutput],
+    ) -> Tuple[ConsensusResultView, InvestmentRecommendation, ConsensusTrace]:
         registry = AgentRegistry()
         for agent in agents:
             registry.register_agent(agent)
@@ -592,17 +715,198 @@ class InvestmentAnalysisService:
                     result.final_solution.confidence,
                 ),
                 position_suggestion=current_recommendation.position_suggestion,
+                decision_rationale=current_recommendation.decision_rationale,
             )
         else:
             recommendation = current_recommendation
 
+        weighted_votes = self._calculate_weighted_votes(agent_outputs)
+        final_action = recommendation.action.value
         view = ConsensusResultView(
             enabled=True,
             rounds_used=result.rounds_used,
             consensus_reached=result.consensus_reached,
-            weighted_votes={},
+            final_action=final_action,
+            weighted_votes=weighted_votes,
         )
-        return view, recommendation
+        trace = self._build_consensus_trace(agent_outputs, final_action, recommendation.confidence)
+        return view, recommendation, trace
+
+    @staticmethod
+    def _calculate_weighted_votes(outputs: List[AgentOutput]) -> Dict[str, float]:
+        votes: Dict[str, float] = {}
+        for output in outputs:
+            action = _ACTION_BY_SIGNAL.get(output.signal, RecommendationAction.HOLD).value
+            votes[action] = round(votes.get(action, 0.0) + output.confidence, 4)
+        return votes
+
+    def _build_consensus_trace(
+        self,
+        agent_outputs: List[AgentOutput],
+        final_action: str,
+        final_confidence: float,
+    ) -> ConsensusTrace:
+        if not agent_outputs:
+            return ConsensusTrace(discussion_enabled=False)
+
+        first_round_agents = [
+            DiscussionAgentEntry(
+                agent_id=output.agent_id,
+                role=output.role,
+                stance=output.stance or "review",
+                current_signal=output.signal,
+                changed_position=False,
+                summary=output.summary,
+                message=output.summary,
+                evidence=output.evidence,
+            )
+            for output in agent_outputs
+        ]
+        final_signal = self._signal_for_action(final_action)
+        final_round_agents = [
+            DiscussionAgentEntry(
+                agent_id=output.agent_id,
+                role=output.role,
+                stance="support" if output.signal == final_signal else "revise",
+                previous_signal=output.signal,
+                current_signal=final_signal,
+                changed_position=output.signal != final_signal,
+                summary=(
+                    f"Aligned to final {final_action} recommendation."
+                    if output.signal != final_signal
+                    else output.summary
+                ),
+                message=(
+                    f"Adjusted view to {final_action}."
+                    if output.signal != final_signal
+                    else output.summary
+                ),
+                evidence=output.evidence,
+            )
+            for output in agent_outputs
+        ]
+
+        rounds = [
+            DiscussionRound(
+                round_number=1,
+                candidate_action=_ACTION_BY_SIGNAL.get(agent_outputs[0].signal, RecommendationAction.HOLD).value,
+                candidate_confidence=max(agent_outputs[0].confidence, 0.0),
+                agents=first_round_agents,
+                agreement_points=["Initial views collected from participating agents."],
+                disagreement_points=["Signals are not yet aligned across all agents."],
+            ),
+            DiscussionRound(
+                round_number=2,
+                candidate_action=final_action,
+                candidate_confidence=final_confidence,
+                agents=final_round_agents,
+                agreement_points=[f"Consensus moved toward {final_action}."],
+                disagreement_points=[],
+            ),
+        ]
+        return ConsensusTrace(
+            discussion_enabled=True,
+            final_summary=f"Agents converged on {final_action} after weighing different signals.",
+            rounds=rounds,
+        )
+
+    @staticmethod
+    def _signal_for_action(action: str) -> str:
+        if action == RecommendationAction.BUY.value:
+            return "bullish"
+        if action == RecommendationAction.SELL.value:
+            return "bearish"
+        return "neutral"
+
+    def _build_analysis_framework(
+        self,
+        mode: InvestmentMode,
+        task_type: str,
+        selected_skills: List[str],
+        data_sources: List[str],
+    ) -> AnalysisFramework:
+        why_selected = [
+            f"Detected {task_type} task.",
+            f"Mode {mode.value} selected {len(selected_skills)} core skill routes.",
+        ]
+        if mode == InvestmentMode.ROUNDTABLE:
+            why_selected.append("Roundtable mode enabled consensus synthesis.")
+        return AnalysisFramework(
+            style="multi_agent_investment_review",
+            task_type=task_type,
+            selected_skills=selected_skills,
+            data_sources=data_sources,
+            why_selected=why_selected,
+        )
+
+    @staticmethod
+    def _build_bull_bear_cases(
+        summary: InvestmentSummary,
+        outputs: List[AgentOutput],
+    ) -> Tuple[List[str], List[str]]:
+        bull_case = [o.summary for o in outputs if o.signal == "bullish"][:3]
+        bear_case = [o.summary for o in outputs if o.signal == "bearish"][:3]
+        if not bull_case:
+            bull_case = summary.key_drivers[:2]
+        if not bear_case:
+            bear_case = summary.key_risks[:2]
+        return bull_case, bear_case
+
+    def _build_catalysts(self, request: InvestmentAnalysisRequest) -> List[CatalystItem]:
+        return [
+            CatalystItem(
+                name=f"{request.asset.symbol} next earnings or major update",
+                direction="two_way",
+                importance="high",
+                time_horizon=request.timeframe.horizon,
+            )
+        ]
+
+    @staticmethod
+    def _build_scenarios(recommendation: InvestmentRecommendation) -> List[ScenarioItem]:
+        action = recommendation.action.value
+        alt = "hold" if action == "buy" else "buy"
+        return [
+            ScenarioItem(name="base", probability=0.6, view=action, description="Most likely path under current information."),
+            ScenarioItem(name="bull", probability=0.25, view="buy", description="Positive catalysts improve upside asymmetry."),
+            ScenarioItem(name="bear", probability=0.15, view=alt if alt != "buy" else "sell", description="Risk events weaken the setup."),
+        ]
+
+    @staticmethod
+    def _build_disagreement_summary(
+        summary: InvestmentSummary,
+        outputs: List[AgentOutput],
+    ) -> DisagreementSummary:
+        unique_signals = sorted({output.signal for output in outputs})
+        disagreement_points = []
+        if len(unique_signals) > 1:
+            disagreement_points.append("Agents disagree on the strength of the current setup.")
+        agreement_points = summary.key_drivers[:2] or ["Agents agree the asset deserves continued monitoring."]
+        return DisagreementSummary(
+            main_conflict=(
+                "Signal dispersion exists between supportive and cautious agents."
+                if disagreement_points
+                else "Agents are broadly aligned on the current setup."
+            ),
+            agreement_points=agreement_points,
+            disagreement_points=disagreement_points,
+        )
+
+    @staticmethod
+    def _build_policy_overrides(summary: Dict[str, Any]) -> PolicyOverrides:
+        return PolicyOverrides(
+            input_action=summary.get("input_action", ""),
+            output_action=summary.get("output_action", ""),
+            input_target_exposure_pct=summary.get("input_target_exposure_pct", 0.0),
+            output_target_exposure_pct=summary.get("output_target_exposure_pct", 0.0),
+            binding_cap=summary.get("binding_cap", "none"),
+            effective_caps=summary.get("effective_caps", {}),
+            triggered_rules=summary.get("triggered_rules", []),
+            human_readable_explanation=(
+                f"Recommendation adjusted from {summary.get('input_action', 'n/a')} to "
+                f"{summary.get('output_action', 'n/a')} under active constraints."
+            ),
+        )
 
     async def _evaluate_risk(
         self,
@@ -610,7 +914,12 @@ class InvestmentAnalysisService:
         recommendation: InvestmentRecommendation,
     ) -> RiskGateResult:
         if not self.risk_coordinator:
-            return RiskGateResult(status="pass", risk_level="low", risk_indicators=[])
+            return RiskGateResult(
+                status="pass",
+                risk_level="low",
+                risk_indicators=[],
+                review_summary="No hard risk block triggered.",
+            )
 
         exposure = recommendation.position_suggestion.get("target_exposure_pct", 0.0)
         amount = float((request.constraints or {}).get("notional_amount", 0.0))
@@ -648,6 +957,7 @@ class InvestmentAnalysisService:
             status=status,
             risk_level=decision.risk_level.value,
             risk_indicators=decision.risk_indicators[:10],
+            review_summary="Risk coordinator reviewed the recommendation.",
         )
 
     def _aggregate_tokens(self, solutions: List[Solution]) -> Dict[str, int]:
