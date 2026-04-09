@@ -17,6 +17,7 @@ services:
       - KNOWLEDGE_BACKEND=${KNOWLEDGE_BACKEND:-memory}
       - EXPERIENCE_BACKEND=${EXPERIENCE_BACKEND:-memory}
       - DATABASE_URL=${DATABASE_URL:-}
+      - SETU_DB_URL=${SETU_DB_URL:-sqlite:////app/data/setu_tasks.db}
     volumes:
       - ./src:/app/src:ro
       - aegean_data:/app/data

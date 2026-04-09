@@ -13,6 +13,7 @@ import httpx
 
 from aegean.core.models import CollaborationMode, GroupConsensusResult
 from aegean.services.group_chat_service import GroupChatService
+from aegean.services.setu_repository import SetuTaskRepository
 from aegean.setu_models import (
     EvaluateAcceptedResponse,
     GovernanceDecision,
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_GOVERNANCE_SUBNET_ID = (
     "0x0110000000000000000000000000000000000000000000000000000000000000"
 )
+DEFAULT_SETU_DB_URL = "sqlite:///./.aegean/setu_tasks.db"
 
 
 class SetuService:
@@ -40,9 +42,12 @@ class SetuService:
     ):
         self.group_service = group_service
         self.config = config or {}
-        self.tasks: Dict[str, SetuTaskRecord] = {}
+        self.repository = SetuTaskRepository(
+            self.config.get("db_url", DEFAULT_SETU_DB_URL)
+        )
+        self.tasks: Dict[str, SetuTaskRecord] = self.repository.load_all_tasks()
         self.task_locks: Dict[str, asyncio.Lock] = {}
-        self.bound_groups: Dict[str, str] = {}
+        self.bound_groups: Dict[str, str] = self.repository.load_bindings()
         self.default_subnet_id = self.config.get(
             "default_subnet_id", DEFAULT_GOVERNANCE_SUBNET_ID
         )
@@ -76,7 +81,10 @@ class SetuService:
             initial_members=self.default_initial_members,
         )
 
-    def _resolve_default_members(self, initial_members: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    def _resolve_default_members(
+        self,
+        initial_members: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
         if initial_members:
             return initial_members
 
@@ -103,40 +111,95 @@ class SetuService:
     ) -> str:
         existing_group_id = self.bound_groups.get(subnet_id)
         if existing_group_id:
-            return existing_group_id
+            group = self.group_service.get_group(existing_group_id)
+            if group and self._is_setu_exclusive_group(group.metadata, subnet_id):
+                self._ensure_group_members(existing_group_id, initial_members or [])
+                return existing_group_id
 
         for group in self.group_service.list_groups(created_by=created_by):
             metadata = group.metadata or {}
-            if (
-                metadata.get("integration") == "setu"
-                and metadata.get("subnet_id") == subnet_id
-            ):
+            if self._is_setu_exclusive_group(metadata, subnet_id):
                 self.bound_groups[subnet_id] = group.group_id
+                self._persist_binding(group.group_id, created_by, metadata, subnet_id)
                 self._ensure_group_members(group.group_id, initial_members or [])
                 return group.group_id
 
+        metadata = {
+            "integration": "setu",
+            "binding_type": "exclusive",
+            "subnet_id": subnet_id,
+            "adapter": "setu",
+            "protocol": "system-subnet-governance-v1",
+            "exclusive_use": True,
+            "visible_in_general_group_apis": False,
+        }
         group = self.group_service.create_group(
             group_name=group_name,
             created_by=created_by,
             description=description,
             mode=CollaborationMode.CONSENSUS,
-            metadata={
-                "integration": "setu",
-                "binding_type": "exclusive",
-                "subnet_id": subnet_id,
-                "adapter": "setu",
-                "protocol": "system-subnet-governance-v1",
-                "exclusive_use": True,
-            },
+            metadata=metadata,
             initial_members=initial_members or [],
         )
         self.bound_groups[subnet_id] = group.group_id
+        self._persist_binding(group.group_id, created_by, metadata, subnet_id)
         logger.info(
             "Setu adapter bound subnet %s -> group %s",
             subnet_id,
             group.group_id,
         )
         return group.group_id
+
+    def _persist_binding(
+        self,
+        group_id: str,
+        created_by: str,
+        metadata: Dict[str, Any],
+        subnet_id: str,
+    ) -> None:
+        group = self.group_service.get_group(group_id)
+        if not group:
+            return
+        self.repository.save_binding(
+            subnet_id=subnet_id,
+            group_id=group.group_id,
+            group_name=group.group_name,
+            created_by=created_by,
+            metadata=metadata,
+            created_at=group.created_at.isoformat(),
+            updated_at=group.updated_at.isoformat(),
+        )
+
+    def _is_setu_exclusive_group(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        subnet_id: Optional[str] = None,
+    ) -> bool:
+        metadata = metadata or {}
+        if metadata.get("integration") != "setu":
+            return False
+        if metadata.get("binding_type") != "exclusive":
+            return False
+        if metadata.get("exclusive_use") is not True:
+            return False
+        if subnet_id is not None and metadata.get("subnet_id") != subnet_id:
+            return False
+        return True
+
+    def is_setu_bound_group(self, group_id: str) -> bool:
+        group = self.group_service.get_group(group_id)
+        if not group:
+            return False
+        return self._is_setu_exclusive_group(group.metadata)
+
+    def list_bound_groups(self) -> List[str]:
+        return sorted(set(self.bound_groups.values()))
+
+    def assert_not_setu_bound_group(self, group_id: str) -> None:
+        if self.is_setu_bound_group(group_id):
+            raise ValueError(
+                f"Group {group_id} is reserved for Setu adapter usage and cannot be mutated via general group APIs"
+            )
 
     def _ensure_group_members(self, group_id: str, initial_members: List[Dict[str, Any]]) -> None:
         existing_member_ids = {m.agent_id for m in self.group_service.get_members(group_id)}
@@ -179,6 +242,10 @@ class SetuService:
         lock = self.task_locks.setdefault(request.task_id, asyncio.Lock())
         async with lock:
             existing = self.tasks.get(request.task_id)
+            if existing is None:
+                existing = self.repository.load_task(request.task_id)
+                if existing is not None:
+                    self.tasks[request.task_id] = existing
             if existing:
                 return EvaluateAcceptedResponse(
                     accepted=True,
@@ -206,6 +273,7 @@ class SetuService:
                 },
             )
             self.tasks[request.task_id] = record
+            self.repository.save_task(record)
 
             logger.info(
                 "Setu task accepted task_id=%s subnet_id=%s group_id=%s proposal_type=%s",
@@ -227,6 +295,10 @@ class SetuService:
 
     def get_result(self, task_id: str) -> SetuResultResponse:
         record = self.tasks.get(task_id)
+        if record is None:
+            record = self.repository.load_task(task_id)
+            if record is not None:
+                self.tasks[task_id] = record
         if not record:
             return SetuResultResponse(status=SetuTaskStatus.NOT_FOUND)
 
@@ -267,6 +339,7 @@ class SetuService:
             record.mark_updated()
             if self.callback_enabled:
                 await self._post_callback(record)
+            self.repository.save_task(record)
             logger.info(
                 "Setu task completed task_id=%s consensus_id=%s approved=%s",
                 record.task_id,
@@ -278,6 +351,7 @@ class SetuService:
             record.status = SetuTaskStatus.FAILED
             record.error = str(exc)
             record.mark_updated()
+            self.repository.save_task(record)
 
     def _proposal_to_task(self, proposal: ProposalContent, record: SetuTaskRecord) -> str:
         action_json = json.dumps(proposal.action, ensure_ascii=False, sort_keys=True)
@@ -439,6 +513,7 @@ class SetuService:
                 response.raise_for_status()
             record.metadata["callback_delivered"] = True
             record.metadata["callback_delivered_at"] = datetime.now(timezone.utc).isoformat()
+            self.repository.save_task(record)
             logger.info(
                 "Setu callback delivered task_id=%s callback_url=%s",
                 record.task_id,
@@ -447,6 +522,7 @@ class SetuService:
         except Exception as exc:
             record.metadata["callback_delivered"] = False
             record.metadata["callback_error"] = str(exc)
+            self.repository.save_task(record)
             logger.warning(
                 "Setu callback failed task_id=%s callback_url=%s error=%s",
                 record.task_id,
@@ -486,6 +562,6 @@ def build_setu_config_from_env() -> Dict[str, Any]:
         "task_timeout_secs": int(os.getenv("SETU_TASK_TIMEOUT_SECS", "300")),
         "callback_enabled": os.getenv("SETU_CALLBACK_ENABLED", "false").lower() == "true",
         "callback_timeout_secs": float(os.getenv("SETU_CALLBACK_TIMEOUT_SECS", "5.0")),
+        "db_url": os.getenv("SETU_DB_URL", DEFAULT_SETU_DB_URL),
         "initial_members": initial_members,
     }
-

@@ -100,3 +100,10 @@ class SetuTaskRecord(BaseModel):
     def mark_updated(self) -> None:
         self.updated_at = datetime.now(timezone.utc)
 
+
+class SetuTaskStoreSnapshot(BaseModel):
+    """Serializable snapshot of persisted Setu adapter runtime state."""
+
+    tasks: List[SetuTaskRecord] = Field(default_factory=list)
+    bound_groups: Dict[str, str] = Field(default_factory=dict)
+    persisted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

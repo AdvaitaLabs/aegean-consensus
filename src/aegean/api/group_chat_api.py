@@ -9,7 +9,7 @@ Provides REST API for:
 """
 
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 
 from aegean.core.models import (
@@ -20,7 +20,9 @@ from aegean.core.models import (
     CollaborationMode,
 )
 from aegean.services.group_chat_service import GroupChatService
-from aegean.core.agent import AgentRegistry
+
+
+_setu_service = None
 
 
 # ==================== Request/Response Models ====================
@@ -160,6 +162,21 @@ def init_service(agent_registry: AgentRegistry, storage_backend=None):
     _service = GroupChatService(agent_registry, storage_backend)
 
 
+def bind_setu_service(setu_service) -> None:
+    """Bind Setu adapter for exclusive-group protection in generic group APIs."""
+    global _setu_service
+    _setu_service = setu_service
+
+
+def _is_hidden_setu_group(group: Group) -> bool:
+    return bool(_setu_service and _setu_service.is_setu_bound_group(group.group_id))
+
+
+def _assert_group_not_reserved(group_id: str) -> None:
+    if _setu_service:
+        _setu_service.assert_not_setu_bound_group(group_id)
+
+
 # ==================== Group Management Endpoints ====================
 
 @router.get("/agents", response_model=List[Dict[str, Any]])
@@ -196,6 +213,7 @@ async def list_available_agents(
 @router.post("/", response_model=Group, status_code=201)
 async def create_group(
     request: CreateGroupRequest,
+    allow_reserved_setu_group: bool = Query(False, description="Internal escape hatch for Setu bootstrap only"),
     service: GroupChatService = Depends(get_service)
 ):
     """
@@ -204,6 +222,16 @@ async def create_group(
     Returns the created Group object.
     """
     try:
+        if not allow_reserved_setu_group and request.metadata:
+            if (
+                request.metadata.get("integration") == "setu"
+                and request.metadata.get("binding_type") == "exclusive"
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Reserved Setu-exclusive groups cannot be created through general group APIs"
+                )
+
         # Convert initial_members to dict format for service
         initial_members = None
         if request.initial_members:
@@ -233,7 +261,7 @@ async def get_group(
     Returns the Group object or 404 if not found.
     """
     group = service.get_group(group_id)
-    if not group:
+    if not group or _is_hidden_setu_group(group):
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
     return group
 
@@ -249,6 +277,7 @@ async def list_groups(
     Returns list of Group objects.
     """
     groups = service.list_groups(created_by=created_by)
+    groups = [g for g in groups if not _is_hidden_setu_group(g)]
     return groups
 
 
@@ -262,6 +291,7 @@ async def delete_group(
     
     Returns 204 on success, 404 if not found.
     """
+    _assert_group_not_reserved(group_id)
     success = service.delete_group(group_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
@@ -282,6 +312,7 @@ async def add_member(
     Returns the created GroupMember object.
     """
     try:
+        _assert_group_not_reserved(group_id)
         member = service.add_member(
             group_id=group_id,
             agent_id=request.agent_id,
@@ -306,6 +337,7 @@ async def remove_member(
     
     Returns 204 on success, 404 if not found.
     """
+    _assert_group_not_reserved(group_id)
     success = service.remove_member(group_id, agent_id)
     if not success:
         raise HTTPException(
@@ -332,7 +364,7 @@ async def get_members(
     """
     # Verify group exists
     group = service.get_group(group_id)
-    if not group:
+    if not group or _is_hidden_setu_group(group):
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
     
     if active_only:
@@ -356,6 +388,7 @@ async def send_message(
     Returns the created Message object.
     """
     try:
+        _assert_group_not_reserved(group_id)
         message = service.send_message(
             group_id=group_id,
             sender_id=request.sender_id,
@@ -383,6 +416,9 @@ async def get_messages(
         
     Returns list of Message objects (newest first).
     """
+    group = service.get_group(group_id)
+    if not group or _is_hidden_setu_group(group):
+        raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
     messages = service.get_messages(group_id, limit=limit)
     return messages
 
@@ -405,6 +441,7 @@ async def execute_consensus(
     Returns GroupConsensusResult with consensus outcome.
     """
     try:
+        _assert_group_not_reserved(group_id)
         risk_context_dict = None
         if request.risk_context:
             risk_context_dict = request.risk_context.dict(exclude_none=True)
@@ -584,7 +621,7 @@ async def get_agent_stats(
     """
     # Verify group exists
     group = service.get_group(group_id)
-    if not group:
+    if not group or _is_hidden_setu_group(group):
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
     
     # Get member info
@@ -645,7 +682,7 @@ async def submit_agent_feedback(
     """
     # Verify group exists
     group = service.get_group(group_id)
-    if not group:
+    if not group or _is_hidden_setu_group(group):
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
     
     # Verify agent is in group
@@ -844,7 +881,7 @@ async def get_group_weights_summary(
     """
     # Verify group exists
     group = service.get_group(group_id)
-    if not group:
+    if not group or _is_hidden_setu_group(group):
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
     
     members = service.get_members(group_id)

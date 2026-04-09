@@ -62,6 +62,7 @@ def create_app(
         config=build_setu_config_from_env(),
     )
     setu_api.init_setu_service(setu_service)
+    group_chat_api.bind_setu_service(setu_service)
     
     # Initialize risk service
     risk_coordinator = risk_api.init_risk_service(
