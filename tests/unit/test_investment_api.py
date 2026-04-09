@@ -33,6 +33,58 @@ from aegean.investment.models import (
 class FakeInvestmentService:
     def __init__(self, behavior: str = "ok"):
         self.behavior = behavior
+        self.runs: Dict[str, Dict[str, Any]] = {
+            "inv-test-001": {
+                "status": "completed",
+                "timeline": [
+                    {
+                        "type": "analysis_started",
+                        "timestamp": "2026-04-09T10:00:00Z",
+                        "request_id": "inv-test-001",
+                        "payload": {"mode": "auto"},
+                    },
+                    {
+                        "type": "constraints_applied",
+                        "timestamp": "2026-04-09T10:00:02Z",
+                        "request_id": "inv-test-001",
+                        "payload": {
+                            "constraints_applied_summary": {
+                                "input_action": "buy",
+                                "output_action": "hold",
+                                "binding_cap": "objective",
+                            }
+                        },
+                    },
+                ],
+                "agents": [
+                    {
+                        "agent_id": "agent_0",
+                        "role": "fundamental_specialist",
+                        "status": "completed",
+                        "signal": "bullish",
+                        "confidence": 0.9,
+                        "summary": "Momentum remains constructive.",
+                    }
+                ],
+                "discussion": {
+                    "enabled": True,
+                    "final_summary": "Agents converged on hold.",
+                    "rounds": [
+                        {
+                            "round_number": 1,
+                            "candidate_action": "buy",
+                            "candidate_confidence": 0.7,
+                            "agents": [],
+                            "agreement_points": [],
+                            "disagreement_points": ["valuation"],
+                        }
+                    ],
+                },
+                "policy_overrides": {"binding_cap": "objective"},
+                "risk_gate": {"status": "pass", "risk_level": "low"},
+                "result": None,
+            }
+        }
 
     async def analyze(self, body: InvestmentAnalysisRequest, event_sink=None) -> InvestmentAnalysisResponse:
         if self.behavior == "value_error":
@@ -72,7 +124,12 @@ class FakeInvestmentService:
                 }
             )
 
-        return _build_response(body)
+        response = _build_response(body)
+        self.runs["inv-test-001"]["result"] = response.model_dump(mode="json")
+        return response
+
+    def get_analysis_run(self, request_id: str) -> Dict[str, Any] | None:
+        return self.runs.get(request_id)
 
 
 @pytest.fixture(autouse=True)
@@ -244,6 +301,106 @@ async def test_analyze_stream_runtime_error_emits_error_and_end() -> None:
     error_event = next(evt for evt in events if evt["type"] == "error")
     assert error_event["payload"]["code"] == 500
     assert error_event["request_id"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_result_returns_completed_response() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis("inv-test-001")
+
+    assert resp.request_id == "inv-test-001"
+    assert resp.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_status_returns_progress() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis_status("inv-test-001")
+
+    assert resp["request_id"] == "inv-test-001"
+    assert resp["status"] == "completed"
+    assert resp["progress_pct"] == 100
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_timeline_returns_events() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis_timeline("inv-test-001")
+
+    assert resp["request_id"] == "inv-test-001"
+    assert len(resp["timeline"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_discussion_returns_trace() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis_discussion("inv-test-001")
+
+    assert resp["request_id"] == "inv-test-001"
+    assert resp["enabled"] is True
+    assert len(resp["rounds"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_agents_returns_panel() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis_agents("inv-test-001")
+
+    assert resp["request_id"] == "inv-test-001"
+    assert resp["agents"][0]["agent_id"] == "agent_0"
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_policy_overrides_returns_payload() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis_policy_overrides("inv-test-001")
+
+    assert resp["policy_overrides"]["binding_cap"] == "objective"
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_risk_gate_returns_payload() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.get_investment_analysis_risk_gate("inv-test-001")
+
+    assert resp["risk_gate"]["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_returns_404_when_missing() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    with pytest.raises(HTTPException) as exc:
+        await investment_api.get_investment_analysis("missing")
+
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_returns_409_when_not_completed() -> None:
+    service = FakeInvestmentService("ok")
+    service.runs["inv-pending-001"] = {
+        "status": "running",
+        "timeline": [],
+        "agents": [],
+        "discussion": {"enabled": False, "final_summary": "", "rounds": []},
+        "policy_overrides": {},
+        "risk_gate": {},
+        "result": None,
+    }
+    investment_api._service = service
+
+    with pytest.raises(HTTPException) as exc:
+        await investment_api.get_investment_analysis("inv-pending-001")
+
+    assert exc.value.status_code == 409
 
 
 @pytest.mark.asyncio

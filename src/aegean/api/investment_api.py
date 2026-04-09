@@ -41,6 +41,13 @@ def _get_service() -> InvestmentAnalysisService:
     return _service
 
 
+def _get_analysis_run_or_404(service: InvestmentAnalysisService, request_id: str) -> dict:
+    run = service.get_analysis_run(request_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Investment analysis {request_id} not found")
+    return run
+
+
 def _to_sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\\n\\n"
 
@@ -58,6 +65,111 @@ async def analyze_investment(body: InvestmentAnalysisRequest) -> InvestmentAnaly
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get(
+    "/analyses/{request_id}",
+    response_model=InvestmentAnalysisResponse,
+    summary="Get investment analysis result by request id",
+)
+async def get_investment_analysis(request_id: str) -> InvestmentAnalysisResponse:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    result = run.get("result")
+    if not result:
+        raise HTTPException(status_code=409, detail=f"Investment analysis {request_id} is not completed yet")
+    return InvestmentAnalysisResponse.model_validate(result)
+
+
+@router.get(
+    "/analyses/{request_id}/status",
+    summary="Get investment analysis status",
+)
+async def get_investment_analysis_status(request_id: str) -> dict:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    timeline = run.get("timeline") or []
+    current_stage = timeline[-1]["type"] if timeline else "pending"
+    status = run.get("status", "running")
+    progress_map = {
+        "pending": 0,
+        "running": 25,
+        "roundtable": 65,
+        "completed": 100,
+    }
+    return {
+        "request_id": request_id,
+        "status": status,
+        "current_stage": current_stage,
+        "progress_pct": progress_map.get(status, 50),
+    }
+
+
+@router.get(
+    "/analyses/{request_id}/timeline",
+    summary="Get investment analysis timeline",
+)
+async def get_investment_analysis_timeline(request_id: str) -> dict:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    return {
+        "request_id": request_id,
+        "status": run.get("status", "running"),
+        "timeline": run.get("timeline", []),
+    }
+
+
+@router.get(
+    "/analyses/{request_id}/discussion",
+    summary="Get investment analysis discussion trace",
+)
+async def get_investment_analysis_discussion(request_id: str) -> dict:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    discussion = run.get("discussion") or {"enabled": False, "final_summary": "", "rounds": []}
+    return {
+        "request_id": request_id,
+        **discussion,
+    }
+
+
+@router.get(
+    "/analyses/{request_id}/agents",
+    summary="Get investment analysis agent panel",
+)
+async def get_investment_analysis_agents(request_id: str) -> dict:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    return {
+        "request_id": request_id,
+        "agents": run.get("agents", []),
+    }
+
+
+@router.get(
+    "/analyses/{request_id}/policy-overrides",
+    summary="Get investment analysis policy overrides",
+)
+async def get_investment_analysis_policy_overrides(request_id: str) -> dict:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    return {
+        "request_id": request_id,
+        "policy_overrides": run.get("policy_overrides", {}),
+    }
+
+
+@router.get(
+    "/analyses/{request_id}/risk-gate",
+    summary="Get investment analysis risk gate result",
+)
+async def get_investment_analysis_risk_gate(request_id: str) -> dict:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    return {
+        "request_id": request_id,
+        "risk_gate": run.get("risk_gate", {}),
+    }
 
 
 @router.post(
