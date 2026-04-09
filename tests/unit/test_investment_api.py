@@ -43,7 +43,25 @@ class FakeInvestmentService:
         if event_sink is not None:
             await event_sink(
                 {
+                    "type": "analysis_started",
+                    "timestamp": "2026-04-09T10:00:00Z",
+                    "request_id": "inv-test-001",
+                    "payload": {"mode": body.mode.value},
+                }
+            )
+            await event_sink(
+                {
+                    "type": "agent_started",
+                    "timestamp": "2026-04-09T10:00:01Z",
+                    "request_id": "inv-test-001",
+                    "payload": {"agent_id": "agent_0", "role": "fundamental_specialist"},
+                }
+            )
+            await event_sink(
+                {
                     "type": "constraints_applied",
+                    "timestamp": "2026-04-09T10:00:02Z",
+                    "request_id": "inv-test-001",
                     "payload": {
                         "constraints_applied_summary": {
                             "input_action": "buy",
@@ -187,9 +205,15 @@ async def test_analyze_stream_success_emits_result_and_end() -> None:
     events = await _collect_sse_events(stream_resp)
     types = [evt["type"] for evt in events]
 
+    assert "analysis_started" in types
+    assert "agent_started" in types
     assert "constraints_applied" in types
     assert "result" in types
     assert types[-1] == "end"
+
+    started_event = next(evt for evt in events if evt["type"] == "analysis_started")
+    assert started_event["request_id"] == "inv-test-001"
+    assert started_event["timestamp"] == "2026-04-09T10:00:00Z"
 
     result_event = next(evt for evt in events if evt["type"] == "result")
     summary = result_event["payload"]["metadata"]["constraints_applied_summary"]
@@ -206,6 +230,7 @@ async def test_analyze_stream_value_error_emits_error_and_end() -> None:
     assert events[-1]["type"] == "end"
     error_event = next(evt for evt in events if evt["type"] == "error")
     assert error_event["payload"]["code"] == 400
+    assert error_event["request_id"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -218,6 +243,7 @@ async def test_analyze_stream_runtime_error_emits_error_and_end() -> None:
     assert events[-1]["type"] == "end"
     error_event = next(evt for evt in events if evt["type"] == "error")
     assert error_event["payload"]["code"] == 500
+    assert error_event["request_id"] == "unknown"
 
 
 @pytest.mark.asyncio

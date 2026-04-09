@@ -293,6 +293,7 @@ class InvestmentAnalysisService:
         self.memory_system = memory_system
         self.llm_client = llm_client
         self.risk_coordinator = risk_coordinator
+        self.analysis_runs: Dict[str, Dict[str, Any]] = {}
 
     async def analyze(
         self,
@@ -302,33 +303,58 @@ class InvestmentAnalysisService:
         started = time.time()
         created_at = _utc_now()
         event_count = 0
+        timeline: List[Dict[str, Any]] = []
+        agents_panel: List[Dict[str, Any]] = []
+        request_id = f"inv-{uuid.uuid4().hex[:12]}"
+        self.analysis_runs[request_id] = {
+            "status": "running",
+            "request": request.model_dump(mode="json"),
+            "timeline": timeline,
+            "agents": agents_panel,
+            "result": None,
+            "discussion": {"enabled": False, "final_summary": "", "rounds": []},
+            "policy_overrides": {},
+            "risk_gate": {},
+        }
 
         async def emit(event_type: str, **payload: Any) -> None:
             nonlocal event_count
             event_count += 1
-            await self._emit(event_sink, event_type, **payload)
+            event = {
+                "type": event_type,
+                "timestamp": _utc_now().isoformat(),
+                "request_id": request_id,
+                "payload": payload,
+            }
+            timeline.append(event)
+            self._update_analysis_run(event, agents_panel)
+            await self._emit(
+                event_sink,
+                event_type,
+                request_id=request_id,
+                event_timestamp=event["timestamp"],
+                **payload,
+            )
 
-        request_id = f"inv-{uuid.uuid4().hex[:12]}"
         task_type = self._task_type_for_asset(request.asset.asset_type)
         selected_skills = self._selected_skills_for_asset(request.asset.asset_type)
         data_sources = self._asset_data_sources_for(request.asset.asset_type)
 
-        await emit("analysis_started", request_id=request_id, mode=request.mode.value)
+        await emit("analysis_started", mode=request.mode.value)
         self._validate_request(request)
-        await emit("request_validated", request_id=request_id)
+        await emit("request_validated")
 
         agents = self._select_agents(request.mode, task_type)
         analysis_framework = self._build_analysis_framework(request.mode, task_type, selected_skills, data_sources)
         await emit(
             "agents_selected",
-            request_id=request_id,
             agent_ids=[a.agent_id for a in agents],
             task_type=task_type,
             selected_skills=selected_skills,
         )
 
         task = self._build_task_prompt(request, task_type, selected_skills)
-        solutions = await self._collect_solutions(agents, task, emit, request_id, task_type)
+        solutions = await self._collect_solutions(agents, task, emit, task_type)
         agent_outputs = [self._solution_to_output(sol, task_type) for sol in solutions]
 
         recommendation, summary = self._merge_outputs(agent_outputs)
@@ -340,16 +366,16 @@ class InvestmentAnalysisService:
         consensus_view = ConsensusResultView(enabled=False)
         consensus_trace = ConsensusTrace(discussion_enabled=False)
         if request.mode == InvestmentMode.ROUNDTABLE and agents:
-            await emit("roundtable_started", request_id=request_id)
+            await emit("roundtable_started")
             consensus_view, recommendation, consensus_trace = await self._run_roundtable(
                 task,
                 agents,
                 recommendation,
                 agent_outputs,
+                emit,
             )
             await emit(
                 "roundtable_finished",
-                request_id=request_id,
                 rounds_used=consensus_view.rounds_used,
                 consensus_reached=consensus_view.consensus_reached,
             )
@@ -358,22 +384,20 @@ class InvestmentAnalysisService:
         policy_overrides = self._build_policy_overrides(constraints_summary)
         await emit(
             "constraints_applied",
-            request_id=request_id,
             action=recommendation.action.value,
             target_exposure_pct=recommendation.position_suggestion.get("target_exposure_pct", 0.0),
             constraints_applied_summary=constraints_summary,
         )
         await emit(
             "recommendation_ready",
-            request_id=request_id,
             action=recommendation.action.value,
             confidence=recommendation.confidence,
         )
 
         risk_gate = await self._evaluate_risk(request, recommendation)
+        await emit("risk_gate_started")
         await emit(
             "risk_gate_finished",
-            request_id=request_id,
             status=risk_gate.status,
             risk_level=risk_gate.risk_level,
         )
@@ -428,7 +452,12 @@ class InvestmentAnalysisService:
             report_markdown=report_md,
             metadata=metadata,
         )
-        await emit("analysis_completed", request_id=request_id)
+        self.analysis_runs[request_id]["status"] = "completed"
+        self.analysis_runs[request_id]["result"] = response.model_dump(mode="json")
+        self.analysis_runs[request_id]["discussion"] = consensus_trace.model_dump(mode="json")
+        self.analysis_runs[request_id]["policy_overrides"] = policy_overrides.model_dump(mode="json")
+        self.analysis_runs[request_id]["risk_gate"] = risk_gate.model_dump(mode="json")
+        await emit("analysis_completed")
         return response
 
     def _validate_request(self, request: InvestmentAnalysisRequest) -> None:
@@ -481,7 +510,6 @@ class InvestmentAnalysisService:
         agents: List[Agent],
         task: str,
         emit: Callable[..., Awaitable[None]],
-        request_id: str,
         task_type: str,
     ) -> List[Solution]:
         if not agents:
@@ -500,7 +528,6 @@ class InvestmentAnalysisService:
         for agent in agents:
             await emit(
                 "agent_started",
-                request_id=request_id,
                 agent_id=agent.agent_id,
                 role=self._role_for_task_type(task_type),
             )
@@ -513,13 +540,17 @@ class InvestmentAnalysisService:
                     answer=f"Agent failed: {result}",
                     confidence=0.2,
                 )
+                await emit(
+                    "agent_failed",
+                    agent_id=agent.agent_id,
+                    message=str(result),
+                )
             else:
                 solution = result
             solutions.append(solution)
             signal = self._extract_signal(solution.answer)
             await emit(
                 "agent_completed",
-                request_id=request_id,
                 agent_id=solution.agent_id,
                 confidence=solution.confidence,
                 signal=signal,
@@ -688,6 +719,7 @@ class InvestmentAnalysisService:
         agents: List[Agent],
         current_recommendation: InvestmentRecommendation,
         agent_outputs: List[AgentOutput],
+        emit: Callable[..., Awaitable[None]],
     ) -> Tuple[ConsensusResultView, InvestmentRecommendation, ConsensusTrace]:
         registry = AgentRegistry()
         for agent in agents:
@@ -730,6 +762,27 @@ class InvestmentAnalysisService:
             weighted_votes=weighted_votes,
         )
         trace = self._build_consensus_trace(agent_outputs, final_action, recommendation.confidence)
+        for round_info in trace.rounds:
+            await emit(
+                "round_started",
+                round_number=round_info.round_number,
+                candidate_action=round_info.candidate_action,
+            )
+            for agent_entry in round_info.agents:
+                await emit(
+                    "agent_replied_in_round",
+                    round_number=round_info.round_number,
+                    agent_id=agent_entry.agent_id,
+                    stance=agent_entry.stance,
+                    current_signal=agent_entry.current_signal,
+                    changed_position=agent_entry.changed_position,
+                )
+            await emit(
+                "round_completed",
+                round_number=round_info.round_number,
+                candidate_action=round_info.candidate_action,
+                candidate_confidence=round_info.candidate_confidence,
+            )
         return view, recommendation, trace
 
     @staticmethod
@@ -1015,7 +1068,62 @@ class InvestmentAnalysisService:
 
         return "\n".join(lines)
 
+    def get_analysis_run(self, request_id: str) -> Optional[Dict[str, Any]]:
+        return self.analysis_runs.get(request_id)
+
+    def _update_analysis_run(self, event: Dict[str, Any], agents_panel: List[Dict[str, Any]]) -> None:
+        request_id = event.get("request_id")
+        if not request_id or request_id not in self.analysis_runs:
+            return
+
+        payload = event.get("payload", {})
+        run = self.analysis_runs[request_id]
+        event_type = event.get("type")
+
+        if event_type == "analysis_started":
+            run["status"] = "running"
+        elif event_type == "analysis_completed":
+            run["status"] = "completed"
+        elif event_type == "round_started":
+            run["status"] = "roundtable"
+        elif event_type == "constraints_applied":
+            run["policy_overrides"] = payload.get("constraints_applied_summary", {})
+        elif event_type == "agent_started":
+            agent_entry = {
+                "agent_id": payload.get("agent_id"),
+                "role": payload.get("role", ""),
+                "status": "running",
+                "signal": "",
+                "confidence": 0.0,
+                "summary": "",
+            }
+            agents_panel.append(agent_entry)
+        elif event_type in {"agent_completed", "agent_failed"}:
+            for item in agents_panel:
+                if item.get("agent_id") == payload.get("agent_id"):
+                    item["status"] = "completed" if event_type == "agent_completed" else "failed"
+                    item["signal"] = payload.get("signal", item.get("signal", ""))
+                    item["confidence"] = payload.get("confidence", item.get("confidence", 0.0))
+                    item["summary"] = payload.get("summary", item.get("summary", ""))
+                    break
+        elif event_type == "agent_replied_in_round":
+            run.setdefault("round_replies", []).append(payload)
+        elif event_type == "risk_gate_finished":
+            run["risk_gate"] = {
+                "status": payload.get("status", "pass"),
+                "risk_level": payload.get("risk_level", "low"),
+            }
+
     async def _emit(self, event_sink: EventSink, event_type: str, **payload: Any) -> None:
         if event_sink is None:
             return
-        await event_sink({"type": event_type, "payload": payload})
+        event_timestamp = payload.pop("event_timestamp", _utc_now().isoformat())
+        request_id = payload.pop("request_id", "unknown")
+        await event_sink(
+            {
+                "type": event_type,
+                "timestamp": event_timestamp,
+                "request_id": request_id,
+                "payload": payload,
+            }
+        )

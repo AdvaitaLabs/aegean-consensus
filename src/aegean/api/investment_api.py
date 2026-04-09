@@ -79,12 +79,24 @@ async def analyze_investment_stream(body: InvestmentAnalysisRequest) -> Streamin
                 result = await service.analyze(body, event_sink=emit)
                 await queue.put({
                     "type": "result",
+                    "timestamp": None,
+                    "request_id": result.request_id,
                     "payload": result.model_dump(mode="json"),
                 })
             except ValueError as exc:
-                await queue.put({"type": "error", "payload": {"code": 400, "message": str(exc)}})
+                await queue.put({
+                    "type": "error",
+                    "timestamp": None,
+                    "request_id": "unknown",
+                    "payload": {"code": 400, "message": str(exc)},
+                })
             except Exception as exc:
-                await queue.put({"type": "error", "payload": {"code": 500, "message": str(exc)}})
+                await queue.put({
+                    "type": "error",
+                    "timestamp": None,
+                    "request_id": "unknown",
+                    "payload": {"code": 500, "message": str(exc)},
+                })
             finally:
                 done.set()
 
@@ -99,6 +111,6 @@ async def analyze_investment_stream(body: InvestmentAnalysisRequest) -> Streamin
             except asyncio.TimeoutError:
                 continue
 
-        yield _to_sse({"type": "end", "payload": {"message": "stream_closed"}})
+        yield _to_sse({"type": "end", "timestamp": None, "request_id": "stream", "payload": {"message": "stream_closed"}})
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
