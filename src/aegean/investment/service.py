@@ -299,13 +299,14 @@ class InvestmentAnalysisService:
         self,
         request: InvestmentAnalysisRequest,
         event_sink: EventSink = None,
+        request_id: Optional[str] = None,
     ) -> InvestmentAnalysisResponse:
         started = time.time()
         created_at = _utc_now()
         event_count = 0
         timeline: List[Dict[str, Any]] = []
         agents_panel: List[Dict[str, Any]] = []
-        request_id = f"inv-{uuid.uuid4().hex[:12]}"
+        request_id = request_id or f"inv-{uuid.uuid4().hex[:12]}"
         self.analysis_runs[request_id] = {
             "status": "running",
             "request": request.model_dump(mode="json"),
@@ -1067,6 +1068,20 @@ class InvestmentAnalysisService:
             lines.append(f"- Reached: {consensus.consensus_reached}")
 
         return "\n".join(lines)
+
+    def create_analysis_run(self, request: InvestmentAnalysisRequest, request_id: Optional[str] = None) -> str:
+        analysis_id = request_id or f"inv-{uuid.uuid4().hex[:12]}"
+        self.analysis_runs[analysis_id] = {
+            "status": "pending",
+            "request": request.model_dump(mode="json"),
+            "timeline": [],
+            "agents": [],
+            "result": None,
+            "discussion": {"enabled": False, "final_summary": "", "rounds": []},
+            "policy_overrides": {},
+            "risk_gate": {},
+        }
+        return analysis_id
 
     def get_analysis_run(self, request_id: str) -> Optional[Dict[str, Any]]:
         return self.analysis_runs.get(request_id)

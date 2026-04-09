@@ -173,6 +173,80 @@ async def get_investment_analysis_risk_gate(request_id: str) -> dict:
 
 
 @router.post(
+    "/analyses",
+    summary="Create investment analysis request",
+)
+async def create_investment_analysis(body: InvestmentAnalysisRequest) -> dict:
+    service = _get_service()
+    request_id = service.create_analysis_run(body)
+    return {
+        "request_id": request_id,
+        "status": "accepted",
+    }
+
+
+@router.get(
+    "/analyses/{request_id}/stream",
+    summary="Stream investment analysis by request id",
+)
+async def stream_investment_analysis(request_id: str) -> StreamingResponse:
+    service = _get_service()
+    run = _get_analysis_run_or_404(service, request_id)
+    request_payload = run.get("request")
+    if not request_payload:
+        raise HTTPException(status_code=409, detail=f"Investment analysis {request_id} request payload missing")
+    body = InvestmentAnalysisRequest.model_validate(request_payload)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        queue: asyncio.Queue = asyncio.Queue()
+        done = asyncio.Event()
+
+        async def emit(event: dict) -> None:
+            await queue.put(event)
+
+        async def run_analysis() -> None:
+            try:
+                result = await service.analyze(body, event_sink=emit, request_id=request_id)
+                await queue.put({
+                    "type": "result",
+                    "timestamp": None,
+                    "request_id": result.request_id,
+                    "payload": result.model_dump(mode="json"),
+                })
+            except ValueError as exc:
+                await queue.put({
+                    "type": "error",
+                    "timestamp": None,
+                    "request_id": request_id,
+                    "payload": {"code": 400, "message": str(exc)},
+                })
+            except Exception as exc:
+                await queue.put({
+                    "type": "error",
+                    "timestamp": None,
+                    "request_id": request_id,
+                    "payload": {"code": 500, "message": str(exc)},
+                })
+            finally:
+                done.set()
+
+        asyncio.create_task(run_analysis())
+
+        while True:
+            if done.is_set() and queue.empty():
+                break
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.25)
+                yield _to_sse(event)
+            except asyncio.TimeoutError:
+                continue
+
+        yield _to_sse({"type": "end", "timestamp": None, "request_id": request_id, "payload": {"message": "stream_closed"}})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post(
     "/analyze/stream",
     summary="Run investment analysis with SSE progress events",
 )

@@ -128,8 +128,23 @@ class FakeInvestmentService:
         self.runs["inv-test-001"]["result"] = response.model_dump(mode="json")
         return response
 
+    def create_analysis_run(self, request: InvestmentAnalysisRequest, request_id: str | None = None) -> str:
+        analysis_id = request_id or f"inv-created-{len(self.runs) + 1:03d}"
+        self.runs[analysis_id] = {
+            "status": "pending",
+            "request": request.model_dump(mode="json"),
+            "timeline": [],
+            "agents": [],
+            "discussion": {"enabled": False, "final_summary": "", "rounds": []},
+            "policy_overrides": {},
+            "risk_gate": {},
+            "result": None,
+        }
+        return analysis_id
+
     def get_analysis_run(self, request_id: str) -> Dict[str, Any] | None:
         return self.runs.get(request_id)
+
 
 
 @pytest.fixture(autouse=True)
@@ -401,6 +416,41 @@ async def test_get_analysis_returns_409_when_not_completed() -> None:
         await investment_api.get_investment_analysis("inv-pending-001")
 
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_create_analysis_returns_request_id() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    resp = await investment_api.create_investment_analysis(_build_request())
+
+    assert resp["status"] == "accepted"
+    assert resp["request_id"].startswith("inv-")
+
+
+@pytest.mark.asyncio
+async def test_stream_analysis_by_request_id_emits_result_and_end() -> None:
+    service = FakeInvestmentService("ok")
+    request = _build_request()
+    request_id = service.create_analysis_run(request, request_id="inv-created-001")
+    investment_api._service = service
+
+    stream_resp = await investment_api.stream_investment_analysis(request_id)
+    events = await _collect_sse_events(stream_resp)
+
+    assert events[0]["request_id"] == "inv-created-001"
+    assert any(evt["type"] == "result" for evt in events)
+    assert events[-1]["type"] == "end"
+
+
+@pytest.mark.asyncio
+async def test_stream_analysis_by_request_id_missing_returns_404() -> None:
+    investment_api._service = FakeInvestmentService("ok")
+
+    with pytest.raises(HTTPException) as exc:
+        await investment_api.stream_investment_analysis("missing")
+
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
