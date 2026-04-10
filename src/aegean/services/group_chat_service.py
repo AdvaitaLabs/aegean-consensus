@@ -401,7 +401,8 @@ class GroupChatService:
         execution_time = (datetime.now() - start_time).total_seconds()
         
         # Build agent graph from discussion
-        agent_graph = discussion_tracker.build_agent_graph()
+        raw_agent_graph = discussion_tracker.build_agent_graph()
+        agent_graph = raw_agent_graph.model_dump() if raw_agent_graph else None
         
         # Build knowledge graph
         # Priority:
