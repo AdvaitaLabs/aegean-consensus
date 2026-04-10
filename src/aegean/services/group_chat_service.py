@@ -782,14 +782,10 @@ class GroupChatService:
 
         return KnowledgeGraph(
             graph_id=f"discussion_graph_{uuid.uuid4().hex[:8]}",
-            source_type="discussion_rounds",
-            source_id=consensus_id,
+            consensus_id=consensus_id,
+            group_id=group_id,
             entities=entities,
             relations=relations,
-            metadata={
-                "round_count": len(discussion_rounds),
-                "agent_count": len(agent_ids),
-            },
         )
 
     def _build_knowledge_graph_from_collaboration_responses(
@@ -868,14 +864,10 @@ class GroupChatService:
 
         return KnowledgeGraph(
             graph_id=f"collaboration_graph_{uuid.uuid4().hex[:8]}",
-            source_type="collaboration_responses",
-            source_id=consensus_id,
+            consensus_id=consensus_id,
+            group_id=group_id,
             entities=entities,
             relations=relations,
-            metadata={
-                "agent_count": len(agent_ids),
-                "response_count": len(agent_responses),
-            },
         )
 
     def get_consensus_result(
