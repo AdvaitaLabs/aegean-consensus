@@ -12,6 +12,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 
+from aegean.core import AgentRegistry
 from aegean.core.models import (
     Group,
     GroupMember,
