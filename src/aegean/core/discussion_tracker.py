@@ -4,16 +4,32 @@ Discussion tracker for recording consensus rounds and agent interactions.
 Tracks how agents discuss, change opinions, and form consensus.
 """
 
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 from datetime import datetime
 from collections import defaultdict
 
-from aegean.core.models import (
-    Solution,
-    RoundDiscussion,
-    AgentRelationship,
-    GroupGraph,
-)
+from pydantic import BaseModel, Field
+
+from aegean.core.models import Solution, RoundDiscussion
+
+
+class AgentRelationship(BaseModel):
+    """Relationship edge between two agents in the discussion graph."""
+
+    source_agent_id: str
+    target_agent_id: str
+    influence_weight: float = Field(0.0, ge=0.0, le=1.0)
+    trust_score: float = Field(0.0, ge=0.0, le=1.0)
+    disagreement_count: int = Field(0, ge=0)
+    agreement_count: int = Field(0, ge=0)
+
+
+class GroupGraph(BaseModel):
+    """Simple discussion graph for a group of agents."""
+
+    group_id: str
+    nodes: List[str] = Field(default_factory=list)
+    edges: List[AgentRelationship] = Field(default_factory=list)
 
 
 class DiscussionTracker:
