@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 import uuid
 import re
+import asyncio
 
 from aegean.core.models import (
     Group,
@@ -22,12 +23,18 @@ from aegean.core.models import (
     KnowledgeGraphEntity,
     KnowledgeGraphRelation,
     TokenUsage,
+    GroupSharedKnowledge,
+    GroupKnowledgeDocument,
+    GroupSkill,
+    GroupKnowledgeInjection,
 )
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.decision_engine import WeightedDecisionEngine
 from aegean.core.discussion_tracker import DiscussionTracker
 from aegean.core.graph_extractor import RiskGraphBuilder
+from aegean.memory.global_memory import GlobalMemorySystem
+from aegean.memory.knowledge_base import KnowledgeBase
 
 
 class GroupChatService:
@@ -45,7 +52,8 @@ class GroupChatService:
     def __init__(
         self,
         agent_registry: AgentRegistry,
-        storage_backend: Optional[Any] = None
+        storage_backend: Optional[Any] = None,
+        memory_system: Optional[GlobalMemorySystem] = None,
     ):
         """
         Initialize GroupChatService.
@@ -56,12 +64,17 @@ class GroupChatService:
         """
         self.agent_registry = agent_registry
         self.storage = storage_backend
+        self.memory_system = memory_system
         
         # In-memory storage (if no backend provided)
         self.groups: Dict[str, Group] = {}
         self.members: Dict[str, List[GroupMember]] = {}  # group_id -> members
         self.messages: Dict[str, List[Message]] = {}  # group_id -> messages
         self.consensus_results: Dict[str, GroupConsensusResult] = {}
+        self.group_skill_registry: Dict[str, List[GroupSkill]] = {}
+        self.group_knowledge_documents: Dict[str, List[GroupKnowledgeDocument]] = {}
+        self.group_knowledge_graphs: Dict[str, List[KnowledgeGraph]] = {}
+        self.group_case_index: Dict[str, List[str]] = {}
         
         # Track agent accuracy per group: group_id -> agent_id -> {total, correct}
         self.agent_accuracy: Dict[str, Dict[str, Dict[str, int]]] = {}
@@ -106,6 +119,11 @@ class GroupChatService:
         self.groups[group_id] = group
         self.members[group_id] = []
         self.messages[group_id] = []
+        self.group_skill_registry[group_id] = []
+        self.group_knowledge_documents[group_id] = []
+        self.group_knowledge_graphs[group_id] = []
+        self.group_case_index[group_id] = []
+        self._sync_group_shared_knowledge(group_id)
         
         # Add initial members if provided
         if initial_members:
@@ -130,7 +148,10 @@ class GroupChatService:
 
     def get_group(self, group_id: str) -> Optional[Group]:
         """Get group by ID."""
-        return self.groups.get(group_id)
+        group = self.groups.get(group_id)
+        if group:
+            self._sync_group_shared_knowledge(group_id)
+        return group
 
     def list_groups(self, created_by: Optional[str] = None) -> List[Group]:
         """
@@ -143,6 +164,8 @@ class GroupChatService:
             List of Group objects
         """
         groups = list(self.groups.values())
+        for group in groups:
+            self._sync_group_shared_knowledge(group.group_id)
         
         if created_by:
             groups = [g for g in groups if g.created_by == created_by]
@@ -165,6 +188,10 @@ class GroupChatService:
         del self.groups[group_id]
         del self.members[group_id]
         del self.messages[group_id]
+        self.group_skill_registry.pop(group_id, None)
+        self.group_knowledge_documents.pop(group_id, None)
+        self.group_knowledge_graphs.pop(group_id, None)
+        self.group_case_index.pop(group_id, None)
         
         return True
 
@@ -219,6 +246,8 @@ class GroupChatService:
         )
         
         self.members[group_id].append(member)
+        self._register_member_specializations_as_skills(group_id, agent_id, role, specialization or {})
+        self._sync_group_shared_knowledge(group_id)
         
         return member
 
@@ -251,6 +280,252 @@ class GroupChatService:
         """Get active members of a group."""
         members = self.members.get(group_id, [])
         return [m for m in members if m.is_active]
+
+    def add_group_skill(
+        self,
+        group_id: str,
+        skill_id: str,
+        name: str,
+        description: str = "",
+        applicable_task_types: Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+        required_data_sources: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> GroupSkill:
+        if group_id not in self.groups:
+            raise ValueError(f"Group {group_id} not found")
+
+        skill = GroupSkill(
+            skill_id=skill_id,
+            name=name,
+            description=description,
+            applicable_task_types=applicable_task_types or [],
+            categories=categories or [],
+            required_data_sources=required_data_sources or [],
+            metadata=metadata or {},
+        )
+
+        existing = self.group_skill_registry.setdefault(group_id, [])
+        for index, current in enumerate(existing):
+            if current.skill_id == skill_id:
+                existing[index] = skill
+                self._sync_group_shared_knowledge(group_id)
+                return skill
+
+        existing.append(skill)
+        self._sync_group_shared_knowledge(group_id)
+        return skill
+
+    def list_group_skills(self, group_id: str) -> List[GroupSkill]:
+        return list(self.group_skill_registry.get(group_id, []))
+
+    def add_group_document(
+        self,
+        group_id: str,
+        doc_id: str,
+        category: str,
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        content: Optional[str] = None,
+    ) -> GroupKnowledgeDocument:
+        if group_id not in self.groups:
+            raise ValueError(f"Group {group_id} not found")
+
+        document_metadata = dict(metadata or {})
+        document_metadata.setdefault("group_id", group_id)
+        if title:
+            document_metadata.setdefault("title", title)
+        if summary:
+            document_metadata.setdefault("summary", summary)
+
+        document = GroupKnowledgeDocument(
+            doc_id=doc_id,
+            category=category,
+            title=title,
+            summary=summary,
+            metadata=document_metadata,
+        )
+
+        existing = self.group_knowledge_documents.setdefault(group_id, [])
+        for index, current in enumerate(existing):
+            if current.doc_id == doc_id:
+                existing[index] = document
+                self._sync_group_shared_knowledge(group_id)
+                self._sync_document_to_knowledge_base(document, content=content)
+                return document
+
+        existing.append(document)
+        self._sync_group_shared_knowledge(group_id)
+        self._sync_document_to_knowledge_base(document, content=content)
+        return document
+
+    def list_group_documents(self, group_id: str) -> List[GroupKnowledgeDocument]:
+        return list(self.group_knowledge_documents.get(group_id, []))
+
+    def add_group_case_reference(self, group_id: str, case_id: str) -> None:
+        if group_id not in self.groups:
+            raise ValueError(f"Group {group_id} not found")
+        cases = self.group_case_index.setdefault(group_id, [])
+        if case_id not in cases:
+            cases.append(case_id)
+            self._sync_group_shared_knowledge(group_id)
+
+    def list_group_case_references(self, group_id: str) -> List[str]:
+        return list(self.group_case_index.get(group_id, []))
+
+    def get_group_shared_knowledge(self, group_id: str) -> GroupSharedKnowledge:
+        if group_id not in self.groups:
+            raise ValueError(f"Group {group_id} not found")
+        self._sync_group_shared_knowledge(group_id)
+        return self.groups[group_id].shared_knowledge
+
+    async def build_group_knowledge_injection(
+        self,
+        group_id: str,
+        query: str,
+        category: Optional[str] = None,
+        categories: Optional[List[str]] = None,
+    ) -> GroupKnowledgeInjection:
+        if group_id not in self.groups:
+            raise ValueError(f"Group {group_id} not found")
+
+        shared = self.get_group_shared_knowledge(group_id)
+        skill_descriptions = [
+            f"{skill.skill_id}: {skill.description or skill.name}"
+            for skill in shared.skills
+        ]
+        document_summaries = [
+            f"[{doc.category}] {doc.title or doc.doc_id}: {doc.summary or ''}".strip()
+            for doc in shared.static_documents
+        ]
+
+        memory_context = ""
+        if self.memory_system:
+            memory = await self.memory_system.retrieve_context(
+                query=query,
+                category=category,
+                categories=categories,
+                include_knowledge=True,
+                include_cases=True,
+                include_performance=False,
+                group_id=group_id,
+                metadata_filters={"group_id": group_id},
+                group_context={
+                    "skills": [skill.skill_id for skill in shared.skills],
+                    "knowledge_graph_ids": shared.knowledge_graph_ids,
+                },
+            )
+            memory_context = memory.format_for_prompt(max_docs=4, max_cases=3)
+
+        return GroupKnowledgeInjection(
+            group_id=group_id,
+            memory_context=memory_context,
+            skill_descriptions=skill_descriptions,
+            document_summaries=document_summaries,
+            historical_case_ids=list(shared.historical_case_ids),
+            graph_ids=list(shared.knowledge_graph_ids),
+            metadata=dict(shared.metadata),
+        )
+
+    def _register_member_specializations_as_skills(
+        self,
+        group_id: str,
+        agent_id: str,
+        role: Optional[str],
+        specialization: Dict[str, float],
+    ) -> None:
+        for task_type, score in specialization.items():
+            normalized = str(task_type).strip()
+            if not normalized:
+                continue
+            skill_id = f"{agent_id}:{normalized}"
+            self.add_group_skill(
+                group_id=group_id,
+                skill_id=skill_id,
+                name=normalized,
+                description=f"Derived from agent specialization ({agent_id})",
+                applicable_task_types=[normalized],
+                metadata={
+                    "source": "agent_specialization",
+                    "agent_id": agent_id,
+                    "role": role,
+                    "score": score,
+                },
+            )
+
+    def _sync_document_to_knowledge_base(
+        self,
+        document: GroupKnowledgeDocument,
+        content: Optional[str] = None,
+    ) -> None:
+        if not self.memory_system:
+            return
+
+        knowledge_base = getattr(self.memory_system, "knowledge_base", None)
+        if not isinstance(knowledge_base, KnowledgeBase):
+            return
+
+        body = (content or document.summary or document.title or document.doc_id).strip()
+        if not body:
+            return
+
+        asyncio.run(
+            knowledge_base.add_document(
+                content=body,
+                category=document.category,
+                metadata=dict(document.metadata),
+                doc_id=document.doc_id,
+            )
+        )
+
+    def _sync_group_shared_knowledge(self, group_id: str) -> None:
+        group = self.groups.get(group_id)
+        if not group:
+            return
+
+        graph_ids = [graph.graph_id for graph in self.group_knowledge_graphs.get(group_id, [])]
+        group.shared_knowledge = GroupSharedKnowledge(
+            static_documents=list(self.group_knowledge_documents.get(group_id, [])),
+            historical_case_ids=list(self.group_case_index.get(group_id, [])),
+            skills=list(self.group_skill_registry.get(group_id, [])),
+            knowledge_graph_ids=graph_ids,
+            metadata={
+                "document_count": len(self.group_knowledge_documents.get(group_id, [])),
+                "case_count": len(self.group_case_index.get(group_id, [])),
+                "skill_count": len(self.group_skill_registry.get(group_id, [])),
+                "graph_count": len(graph_ids),
+            },
+        )
+
+    def _apply_group_knowledge_to_task(
+        self,
+        task: str,
+        injection: Optional[GroupKnowledgeInjection],
+    ) -> str:
+        if not injection:
+            return task
+
+        sections = [task]
+        if injection.memory_context:
+            sections.append("[Group Memory Context]\n" + injection.memory_context)
+        if injection.skill_descriptions:
+            sections.append(
+                "[Group Skills]\n" + "\n".join(f"- {item}" for item in injection.skill_descriptions[:8])
+            )
+        if injection.document_summaries:
+            sections.append(
+                "[Group Documents]\n" + "\n".join(f"- {item}" for item in injection.document_summaries[:8])
+            )
+        if injection.historical_case_ids:
+            sections.append(
+                "[Group Historical Cases]\n" + "\n".join(f"- {item}" for item in injection.historical_case_ids[:8])
+            )
+        if injection.graph_ids:
+            sections.append(
+                "[Group Knowledge Graphs]\n" + "\n".join(f"- {item}" for item in injection.graph_ids[:8])
+            )
+        return "\n\n".join(section for section in sections if section)
 
     # ==================== Message Management ====================
 
@@ -358,6 +633,11 @@ class GroupChatService:
             raise ValueError(f"Group {group_id} not found")
         
         group = self.groups[group_id]
+        shared_knowledge_injection = await self.build_group_knowledge_injection(
+            group_id=group_id,
+            query=task,
+        )
+        task = self._apply_group_knowledge_to_task(task, shared_knowledge_injection)
         active_members = self.get_active_members(group_id)
         
         if not active_members:
@@ -428,6 +708,10 @@ class GroupChatService:
                     agent_responses=result.get("agent_responses", []),
                     agent_ids=agent_ids,
                 )
+        if knowledge_graph is not None:
+            self.group_knowledge_graphs.setdefault(group_id, []).append(knowledge_graph)
+            self.add_group_case_reference(group_id, consensus_id)
+            self._sync_group_shared_knowledge(group_id)
         
         # Build response
         token_solutions = result.get("token_solutions") or result.get("agent_responses", [])

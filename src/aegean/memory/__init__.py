@@ -9,7 +9,7 @@ Provides:
 - Knowledge base management (batch import, maintenance)
 """
 
-from aegean.memory.knowledge_base import KnowledgeBase, Document, RetrievalResult
+from aegean.memory.knowledge_base import KnowledgeBase, Document, RetrievalResult, KnowledgeQuery
 from aegean.memory.experience_base import ExperienceBase, ConsensusRecord, AgentPerformance
 from aegean.memory.global_memory import GlobalMemorySystem, MemoryContext
 from aegean.memory.prompt_enhancer import PromptEnhancer, PromptTemplate, MemoryAwareAgent
@@ -24,6 +24,7 @@ __all__ = [
     # Data models
     "Document",
     "RetrievalResult",
+    "KnowledgeQuery",
     "ConsensusRecord",
     "AgentPerformance",
     "MemoryContext",

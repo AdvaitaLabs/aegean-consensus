@@ -275,6 +275,8 @@ class BaseValidator(ABC):
         try:
             query = self._get_rag_query(request)
             category = self._get_rag_category()
+            group_id = request.metadata.get("group_id") if isinstance(request.metadata, dict) else None
+            group_context = request.metadata.get("group_context") if isinstance(request.metadata, dict) else None
 
             context = await self.memory_system.retrieve_context(
                 query=query,
@@ -282,6 +284,9 @@ class BaseValidator(ABC):
                 include_knowledge=True,
                 include_cases=True,
                 include_performance=False,
+                group_id=group_id,
+                metadata_filters=({"group_id": group_id} if group_id else None),
+                group_context=group_context,
             )
             return context.format_for_prompt(max_docs=3, max_cases=2)
         except Exception as e:

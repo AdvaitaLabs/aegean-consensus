@@ -216,6 +216,7 @@ class Group(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    shared_knowledge: "GroupSharedKnowledge" = Field(default_factory=lambda: GroupSharedKnowledge())
 
     class Config:
         json_schema_extra = {
@@ -330,6 +331,42 @@ class KnowledgeGraph(BaseModel):
     entities: List[KnowledgeGraphEntity] = Field(default_factory=list)
     relations: List[KnowledgeGraphRelation] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.now)
+
+
+class GroupSkill(BaseModel):
+    skill_id: str = Field(..., description="Unique skill identifier")
+    name: str = Field(..., description="Human-readable skill name")
+    description: str = Field(default="", description="Skill description")
+    applicable_task_types: List[str] = Field(default_factory=list)
+    categories: List[str] = Field(default_factory=list)
+    required_data_sources: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GroupKnowledgeDocument(BaseModel):
+    doc_id: str = Field(..., description="Document identifier")
+    category: str = Field(..., description="Knowledge category")
+    title: Optional[str] = Field(None, description="Optional document title")
+    summary: Optional[str] = Field(None, description="Optional short summary")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GroupSharedKnowledge(BaseModel):
+    static_documents: List[GroupKnowledgeDocument] = Field(default_factory=list)
+    historical_case_ids: List[str] = Field(default_factory=list)
+    skills: List[GroupSkill] = Field(default_factory=list)
+    knowledge_graph_ids: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GroupKnowledgeInjection(BaseModel):
+    group_id: str
+    memory_context: str = ""
+    skill_descriptions: List[str] = Field(default_factory=list)
+    document_summaries: List[str] = Field(default_factory=list)
+    historical_case_ids: List[str] = Field(default_factory=list)
+    graph_ids: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GroupConsensusResult(BaseModel):

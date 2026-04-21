@@ -185,6 +185,15 @@ def _build_response(body: InvestmentAnalysisRequest) -> InvestmentAnalysisRespon
             task_type=task_type,
             selected_skills=selected_skills,
             data_sources=data_sources,
+            panel_roles=["fundamental_specialist", "valuation_specialist"],
+            panel_role_skills={
+                "fundamental_specialist": ["fundamental_analysis"],
+                "valuation_specialist": ["equity_valuation"],
+            },
+            panel_role_data_focus={
+                "fundamental_specialist": ["fundamentals", "market"],
+                "valuation_specialist": ["fundamentals", "market"],
+            },
             why_selected=["Detected task type"],
         ),
         recommendation=InvestmentRecommendation(
@@ -214,6 +223,15 @@ def _build_response(body: InvestmentAnalysisRequest) -> InvestmentAnalysisRespon
             latency_ms=10,
             data_sources=data_sources,
             selected_skills=selected_skills,
+            panel_roles=["fundamental_specialist", "valuation_specialist"],
+            panel_role_skills={
+                "fundamental_specialist": ["fundamental_analysis"],
+                "valuation_specialist": ["equity_valuation"],
+            },
+            panel_role_data_focus={
+                "fundamental_specialist": ["fundamentals", "market"],
+                "valuation_specialist": ["fundamentals", "market"],
+            },
             task_type=task_type,
             constraints_applied_summary={"binding_cap": "objective"},
             schema_version="investment_analysis.v2",
@@ -245,6 +263,8 @@ async def test_analyze_investment_success_returns_response() -> None:
     assert resp.request_id == "inv-test-001"
     assert resp.recommendation.action == RecommendationAction.HOLD
     assert resp.analysis_framework.task_type == "equity_analysis"
+    assert resp.analysis_framework.panel_roles == ["fundamental_specialist", "valuation_specialist"]
+    assert resp.metadata.panel_role_skills["valuation_specialist"] == ["equity_valuation"]
 
 
 @pytest.mark.asyncio

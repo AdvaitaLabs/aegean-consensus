@@ -35,6 +35,18 @@ class RetrievalResult:
     total_results: int
 
 
+@dataclass
+class KnowledgeQuery:
+    """Structured query options for knowledge retrieval."""
+    query: str
+    top_k: int = 5
+    category: Optional[str] = None
+    min_score: float = 0.0
+    group_id: Optional[str] = None
+    categories: Optional[List[str]] = None
+    metadata_filters: Optional[Dict[str, Any]] = None
+
+
 class KnowledgeBase:
     """
     Knowledge base for storing and retrieving static knowledge.
@@ -198,7 +210,10 @@ class KnowledgeBase:
         query: str,
         top_k: int = 5,
         category: Optional[str] = None,
-        min_score: float = 0.0
+        min_score: float = 0.0,
+        group_id: Optional[str] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
     ) -> RetrievalResult:
         """
         Retrieve relevant documents for a query.
@@ -217,7 +232,15 @@ class KnowledgeBase:
         
         # Search based on backend
         if self.backend == "memory":
-            results = self._search_memory(query_embedding, top_k, category, min_score)
+            results = self._search_memory(
+                query_embedding,
+                top_k,
+                category,
+                min_score,
+                group_id=group_id,
+                categories=categories,
+                metadata_filters=metadata_filters,
+            )
         elif self.backend == "milvus":
             results = self._search_milvus(query_embedding, top_k, category, min_score)
         elif self.backend == "pinecone":
@@ -321,16 +344,34 @@ class KnowledgeBase:
         query_embedding: List[float],
         top_k: int,
         category: Optional[str],
-        min_score: float
+        min_score: float,
+        group_id: Optional[str] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
     ) -> RetrievalResult:
         """Search in-memory storage."""
         import numpy as np
         
-        # Filter by category
-        candidates = [
-            (doc_id, doc) for doc_id, doc in self._documents.items()
-            if category is None or doc.category == category
-        ]
+        allowed_categories = set(categories or [])
+        if category:
+            allowed_categories.add(category)
+
+        # Filter by category / group / metadata
+        candidates = []
+        for doc_id, doc in self._documents.items():
+            if allowed_categories and doc.category not in allowed_categories:
+                continue
+            if group_id is not None and doc.metadata.get("group_id") != group_id:
+                continue
+            if metadata_filters:
+                matched = True
+                for key, value in metadata_filters.items():
+                    if doc.metadata.get(key) != value:
+                        matched = False
+                        break
+                if not matched:
+                    continue
+            candidates.append((doc_id, doc))
         
         if not candidates:
             return RetrievalResult(documents=[], scores=[], query="", total_results=0)

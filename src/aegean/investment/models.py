@@ -71,7 +71,11 @@ class AnalysisFramework(BaseModel):
     style: str = "multi_agent_investment_review"
     task_type: str = ""
     selected_skills: List[str] = Field(default_factory=list)
+    resolved_skill_profiles: List[Dict[str, Any]] = Field(default_factory=list)
     data_sources: List[str] = Field(default_factory=list)
+    panel_roles: List[str] = Field(default_factory=list)
+    panel_role_skills: Dict[str, List[str]] = Field(default_factory=dict)
+    panel_role_data_focus: Dict[str, List[str]] = Field(default_factory=dict)
     why_selected: List[str] = Field(default_factory=list)
 
 
@@ -121,6 +125,7 @@ class DiscussionAgentEntry(BaseModel):
 
 class DiscussionRound(BaseModel):
     round_number: int
+    stage: str = ""
     candidate_action: str = ""
     candidate_confidence: float = Field(0.0, ge=0.0, le=1.0)
     agents: List[DiscussionAgentEntry] = Field(default_factory=list)
@@ -160,6 +165,27 @@ class ConsensusResultView(BaseModel):
     weighted_votes: Dict[str, float] = Field(default_factory=dict)
 
 
+class ExternalEvidenceNode(BaseModel):
+    node_type: str = Field(description="evidence | negative_evidence | organization")
+    label: str
+    source: str = ""
+    provider: str = ""
+    polarity: str = "neutral"
+    url: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExternalNewsItem(BaseModel):
+    title: str
+    source: str = ""
+    provider: str = ""
+    url: str = ""
+    summary: str = ""
+    polarity: str = "neutral"
+    published_at: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class InvestmentMetadata(BaseModel):
     token_usage: Dict[str, int] = Field(
         default_factory=lambda: {"prompt": 0, "completion": 0, "total": 0}
@@ -167,8 +193,14 @@ class InvestmentMetadata(BaseModel):
     latency_ms: int = 0
     data_sources: List[str] = Field(default_factory=list)
     selected_skills: List[str] = Field(default_factory=list)
+    resolved_skill_profiles: List[Dict[str, Any]] = Field(default_factory=list)
+    panel_roles: List[str] = Field(default_factory=list)
+    panel_role_skills: Dict[str, List[str]] = Field(default_factory=dict)
+    panel_role_data_focus: Dict[str, List[str]] = Field(default_factory=dict)
     task_type: str = ""
     constraints_applied_summary: Dict[str, Any] = Field(default_factory=dict)
+    provider_status: Dict[str, Any] = Field(default_factory=dict)
+    provider_signals: List[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     event_count: int = 0
@@ -219,4 +251,6 @@ class InvestmentAnalysisResponse(BaseModel):
     policy_overrides: PolicyOverrides = Field(default_factory=PolicyOverrides)
 
     report_markdown: str = ""
+    external_evidence_nodes: List[ExternalEvidenceNode] = Field(default_factory=list)
+    external_news_items: List[ExternalNewsItem] = Field(default_factory=list)
     metadata: InvestmentMetadata = Field(default_factory=InvestmentMetadata)

@@ -30,8 +30,8 @@ from aegean.risk.models import (
 from aegean.risk.sequencer import Sequencer
 from aegean.risk.session import SessionManager
 from aegean.risk.challenge import ChallengeManager
-from aegean.risk.validators.base_validator import BaseValidator
 from aegean.memory.global_memory import GlobalMemorySystem
+from aegean.risk.validators.base_validator import BaseValidator
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,7 @@ class RiskConsensusCoordinator:
         )
 
         # Step 3: Run validators in parallel
+        request = await self._inject_group_context(request)
         validator_results = await self._run_validators(
             request=request,
             active_types=seq_decision.active_validators,
@@ -172,6 +173,38 @@ class RiskConsensusCoordinator:
         return new_decision
 
     # ==================== Internal Pipeline ====================
+
+    async def _inject_group_context(self, request: RiskRequest) -> RiskRequest:
+        if not self.memory_system:
+            return request
+
+        group_id = None
+        if isinstance(request.metadata, dict):
+            group_id = request.metadata.get("group_id")
+        if not group_id:
+            return request
+
+        group_context = request.metadata.get("group_context") if isinstance(request.metadata, dict) else None
+        if group_context:
+            return request
+
+        query = request.context.trace_context or request.context.description or request.context.action_type
+        memory = await self.memory_system.retrieve_context(
+            query=query,
+            group_id=group_id,
+            include_knowledge=True,
+            include_cases=True,
+            include_performance=False,
+            metadata_filters={"group_id": group_id},
+            group_context={"skills": [], "knowledge_graph_ids": []},
+        )
+        next_metadata = dict(request.metadata)
+        next_metadata["group_context"] = {
+            "skills": list(memory.group_skills or []),
+            "knowledge_graph_ids": list(memory.group_graph_ids or []),
+            "memory_context": memory.format_for_prompt(max_docs=4, max_cases=3),
+        }
+        return request.model_copy(update={"metadata": next_metadata})
 
     async def _run_validators(
         self,

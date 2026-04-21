@@ -15,7 +15,7 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
 
-from aegean.memory.knowledge_base import KnowledgeBase, Document, RetrievalResult
+from aegean.memory.knowledge_base import KnowledgeBase, Document, RetrievalResult, KnowledgeQuery
 from aegean.memory.experience_base import ExperienceBase, ConsensusRecord, AgentPerformance
 
 
@@ -35,11 +35,16 @@ class MemoryContext:
     
     # Agent performance
     agent_performance: Dict[str, AgentPerformance]
+
+    # Group shared context
+    group_id: Optional[str] = None
+    group_skills: List[str] = None
+    group_graph_ids: List[str] = None
     
     # Statistics
-    total_knowledge_docs: int
-    total_similar_cases: int
-    retrieval_time: float
+    total_knowledge_docs: int = 0
+    total_similar_cases: int = 0
+    retrieval_time: float = 0.0
     
     def format_for_prompt(self, max_docs: int = 3, max_cases: int = 2) -> str:
         """
@@ -79,6 +84,13 @@ class MemoryContext:
                     f"\n- {agent_id}: 准确率 {perf.accuracy:.1%}, "
                     f"参与 {perf.total_participations} 次"
                 )
+
+        if self.group_id:
+            sections.append(f"\n\n【Group上下文】\n- Group ID: {self.group_id}")
+            if self.group_skills:
+                sections.append(f"- Group Skills: {', '.join(self.group_skills[:8])}")
+            if self.group_graph_ids:
+                sections.append(f"- Knowledge Graph IDs: {', '.join(self.group_graph_ids[:5])}")
         
         return "\n".join(sections)
 
@@ -134,7 +146,11 @@ class GlobalMemorySystem:
         category: Optional[str] = None,
         include_knowledge: bool = True,
         include_cases: bool = True,
-        include_performance: bool = True
+        include_performance: bool = True,
+        group_id: Optional[str] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+        group_context: Optional[Dict[str, Any]] = None,
     ) -> MemoryContext:
         """
         Retrieve unified memory context for a query.
@@ -161,7 +177,10 @@ class GlobalMemorySystem:
                 query=query,
                 top_k=self.config.get("knowledge_top_k", 5),
                 category=category,
-                min_score=self.config.get("knowledge_min_score", 0.5)
+                min_score=self.config.get("knowledge_min_score", 0.5),
+                group_id=group_id,
+                categories=categories,
+                metadata_filters=metadata_filters,
             )
             knowledge_docs = kb_result.documents
             knowledge_scores = kb_result.scores
@@ -192,11 +211,20 @@ class GlobalMemorySystem:
         
         retrieval_time = time.time() - start_time
         
+        group_skills: List[str] = []
+        group_graph_ids: List[str] = []
+        if group_context:
+            group_skills = list(group_context.get("skills", []))
+            group_graph_ids = list(group_context.get("knowledge_graph_ids", []))
+        
         return MemoryContext(
             knowledge_documents=knowledge_docs,
             knowledge_scores=knowledge_scores,
             similar_cases=similar_cases,
             agent_performance=agent_performance,
+            group_id=group_id,
+            group_skills=group_skills,
+            group_graph_ids=group_graph_ids,
             total_knowledge_docs=len(knowledge_docs),
             total_similar_cases=len(similar_cases),
             retrieval_time=retrieval_time
