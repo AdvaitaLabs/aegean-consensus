@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from aegean.core.agent import Agent, AgentRegistry
 from aegean.core.coordinator import ConsensusCoordinator
 from aegean.core.decision_engine import WeightedDecisionEngine
-from aegean.core.models import ConsensusConfig, Solution
+from aegean.core.models import ConsensusConfig, Solution, GroupKnowledgeInjection
 from aegean.investment.models import (
     AgentOutput,
     AnalysisFramework,
@@ -23,6 +23,8 @@ from aegean.investment.models import (
     DisagreementSummary,
     DiscussionAgentEntry,
     DiscussionRound,
+    ExternalEvidenceNode,
+    ExternalNewsItem,
     InvestmentAnalysisRequest,
     InvestmentAnalysisResponse,
     InvestmentMetadata,
@@ -37,6 +39,9 @@ from aegean.investment.models import (
 )
 from aegean.risk.models import RiskContext, RiskRequest, RiskSubject
 from aegean.risk.risk_consensus import RiskConsensusCoordinator
+from aegean.services.group_chat_service import GroupChatService
+from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, SerpAPIProvider, TavilyProvider, TushareProvider, YFinanceProvider
+from aegean.investment.providers.gateway import InvestmentDataGateway
 
 
 _SIGNAL_MAP = {
@@ -74,8 +79,37 @@ _ROLE_BY_TASK_TYPE = {
     "crypto_analysis": "crypto_specialist",
 }
 
+_EQUITY_PANEL_ROLES = [
+    "fundamental_specialist",
+    "valuation_specialist",
+    "macro_specialist",
+    "risk_specialist",
+]
+
+_ROLE_DATA_FOCUS = {
+    "fundamental_specialist": ["fundamentals", "market"],
+    "valuation_specialist": ["fundamentals", "market"],
+    "allocation_specialist": ["market"],
+    "macro_specialist": ["market", "news"],
+    "fund_specialist": ["fundamentals", "market"],
+    "convertible_bond_specialist": ["fundamentals", "market"],
+    "futures_specialist": ["market", "news"],
+    "options_specialist": ["market"],
+    "crypto_specialist": ["market", "news"],
+    "risk_specialist": ["news", "market"],
+    "investment_specialist": ["market", "fundamentals", "news"],
+}
+
+_ROLE_SKILL_FOCUS = {
+    "fundamental_specialist": ["fundamental_analysis"],
+    "valuation_specialist": ["equity_valuation"],
+    "macro_specialist": ["macro_regime"],
+    "risk_specialist": ["general_investment_analysis"],
+}
+
 _TITLE_BY_ROLE = {
     "fundamental_specialist": "Fundamental Analysis Agent",
+    "valuation_specialist": "Equity Valuation Agent",
     "allocation_specialist": "Allocation Analysis Agent",
     "macro_specialist": "Macro Analysis Agent",
     "fund_specialist": "Fund Selection Agent",
@@ -120,6 +154,111 @@ _ASSET_SKILLS = {
     AssetType.FUTURES: ["futures_basis", "margin_risk"],
     AssetType.OPTIONS: ["options_greeks", "vol_surface"],
     AssetType.CRYPTO: ["onchain_signal", "liquidity_microstructure"],
+}
+
+_SKILL_PROFILES = {
+    "fundamental_analysis": {
+        "name": "Fundamental Analysis",
+        "description": "Review business quality, earnings power, and operating momentum.",
+        "categories": ["investment_methodology", "equity_research"],
+        "required_data_sources": ["public_market_data", "company_fundamentals"],
+    },
+    "equity_valuation": {
+        "name": "Equity Valuation",
+        "description": "Assess valuation ranges, multiple compression risk, and upside/downside asymmetry.",
+        "categories": ["investment_methodology", "valuation"],
+        "required_data_sources": ["public_market_data", "company_fundamentals"],
+    },
+    "index_tracking": {
+        "name": "Index Tracking",
+        "description": "Evaluate benchmark composition, tracking behavior, and replication quality.",
+        "categories": ["etf_research", "portfolio_construction"],
+        "required_data_sources": ["public_market_data", "etf_holdings"],
+    },
+    "allocation_analysis": {
+        "name": "Allocation Analysis",
+        "description": "Judge fit with portfolio objectives, diversification impact, and exposure budgets.",
+        "categories": ["portfolio_construction"],
+        "required_data_sources": ["public_market_data", "etf_holdings"],
+    },
+    "macro_regime": {
+        "name": "Macro Regime",
+        "description": "Analyze macro cycle, policy backdrop, and index-level regime sensitivity.",
+        "categories": ["macro", "index_research"],
+        "required_data_sources": ["public_market_data", "macro_indicators"],
+    },
+    "index_structure": {
+        "name": "Index Structure",
+        "description": "Review concentration, factor tilt, and structural exposures of the index.",
+        "categories": ["index_research"],
+        "required_data_sources": ["public_market_data", "macro_indicators"],
+    },
+    "fund_selection": {
+        "name": "Fund Selection",
+        "description": "Evaluate strategy persistence, fit-for-purpose, and product quality.",
+        "categories": ["fund_research"],
+        "required_data_sources": ["public_market_data", "fund_nav_feed"],
+    },
+    "manager_style": {
+        "name": "Manager Style",
+        "description": "Assess manager behavior, style drift, and repeatability of returns.",
+        "categories": ["fund_research"],
+        "required_data_sources": ["fund_nav_feed"],
+    },
+    "credit_analysis": {
+        "name": "Credit Analysis",
+        "description": "Evaluate balance-sheet risk, default sensitivity, and credit spread resilience.",
+        "categories": ["credit", "bond_research"],
+        "required_data_sources": ["public_market_data", "bond_termsheet_feed"],
+    },
+    "equity_optional_value": {
+        "name": "Equity Optional Value",
+        "description": "Analyze embedded equity optionality in convertible instruments.",
+        "categories": ["convertible_bond", "valuation"],
+        "required_data_sources": ["public_market_data", "bond_termsheet_feed"],
+    },
+    "futures_basis": {
+        "name": "Futures Basis",
+        "description": "Review basis structure, carry signal, and term curve behavior.",
+        "categories": ["derivatives", "futures"],
+        "required_data_sources": ["public_market_data", "futures_curve_feed"],
+    },
+    "margin_risk": {
+        "name": "Margin Risk",
+        "description": "Assess leverage, margin sensitivity, and liquidation risk.",
+        "categories": ["derivatives", "risk_controls"],
+        "required_data_sources": ["margin_rules", "futures_curve_feed"],
+    },
+    "options_greeks": {
+        "name": "Options Greeks",
+        "description": "Analyze delta, gamma, theta, and vega exposure around the trade idea.",
+        "categories": ["derivatives", "options"],
+        "required_data_sources": ["public_market_data", "option_chain_feed"],
+    },
+    "vol_surface": {
+        "name": "Vol Surface",
+        "description": "Assess implied volatility term structure and skew for option positioning.",
+        "categories": ["derivatives", "options"],
+        "required_data_sources": ["vol_surface_feed", "option_chain_feed"],
+    },
+    "onchain_signal": {
+        "name": "On-chain Signal",
+        "description": "Evaluate wallet activity, network usage, and structural on-chain demand signals.",
+        "categories": ["crypto", "onchain_research"],
+        "required_data_sources": ["public_market_data", "onchain_metrics"],
+    },
+    "liquidity_microstructure": {
+        "name": "Liquidity Microstructure",
+        "description": "Review exchange depth, spread quality, and execution fragility.",
+        "categories": ["crypto", "market_microstructure"],
+        "required_data_sources": ["exchange_depth_feed", "public_market_data"],
+    },
+    "general_investment_analysis": {
+        "name": "General Investment Analysis",
+        "description": "Fallback generalist investment reasoning skill.",
+        "categories": ["investment_methodology"],
+        "required_data_sources": ["public_market_data"],
+    },
 }
 
 _ASSET_DATA_SOURCES = {
@@ -288,11 +427,34 @@ class InvestmentAnalysisService:
         memory_system: Optional[Any] = None,
         llm_client: Optional[Any] = None,
         risk_coordinator: Optional[RiskConsensusCoordinator] = None,
+        group_service: Optional[GroupChatService] = None,
     ):
         self.agent_registry = agent_registry
         self.memory_system = memory_system
         self.llm_client = llm_client
         self.risk_coordinator = risk_coordinator
+        self.group_service = group_service
+        self.market_data_provider = YFinanceProvider()
+        self.cn_market_data_provider = TushareProvider()
+        self.crypto_market_data_provider = CoinGeckoProvider()
+        self.fundamental_data_provider = FMPProvider()
+        self.cn_fundamental_data_provider = TushareProvider()
+        self.news_data_provider = FinnhubProvider()
+        self.search_data_provider = TavilyProvider()
+        self.search_fallback_provider = ExaProvider()
+        self.data_gateway = InvestmentDataGateway(
+            {
+                "market": self.market_data_provider,
+                "cn_market": self.cn_market_data_provider,
+                "crypto_market": self.crypto_market_data_provider,
+                "fundamentals": self.fundamental_data_provider,
+                "cn_fundamentals": self.cn_fundamental_data_provider,
+                "news": self.news_data_provider,
+                "search": self.search_data_provider,
+                "search_fallback": self.search_fallback_provider,
+                "search_fallback_2": SerpAPIProvider(),
+            }
+        )
         self.analysis_runs: Dict[str, Dict[str, Any]] = {}
 
     async def analyze(
@@ -339,28 +501,81 @@ class InvestmentAnalysisService:
 
         task_type = self._task_type_for_asset(request.asset.asset_type)
         selected_skills = self._selected_skills_for_asset(request.asset.asset_type)
+        resolved_skill_profiles = self._resolve_skill_profiles(selected_skills)
         data_sources = self._asset_data_sources_for(request.asset.asset_type)
+        normalized_market_data = await self._fetch_normalized_asset_data(request)
+        group_injection = await self._build_group_knowledge_injection(request, task_type)
 
-        await emit("analysis_started", mode=request.mode.value)
+        await emit(
+            "analysis_started",
+            mode=request.mode.value,
+            group_id=(group_injection.group_id if group_injection else None),
+        )
         self._validate_request(request)
         await emit("request_validated")
 
         agents = self._select_agents(request.mode, task_type)
-        analysis_framework = self._build_analysis_framework(request.mode, task_type, selected_skills, data_sources)
+        panel_roles = self._panel_roles_for_task(task_type)
+        panel_role_skills = {
+            role: self._skills_for_role(role, selected_skills)
+            for role in panel_roles
+        }
+        panel_role_data_focus = {
+            role: list(_ROLE_DATA_FOCUS.get(role, ["market", "fundamentals", "news"]))
+            for role in panel_roles
+        }
+        analysis_framework = self._build_analysis_framework(
+            request.mode,
+            task_type,
+            selected_skills,
+            data_sources,
+            resolved_skill_profiles,
+            group_injection,
+            panel_roles,
+            panel_role_skills,
+            panel_role_data_focus,
+        )
         await emit(
             "agents_selected",
             agent_ids=[a.agent_id for a in agents],
             task_type=task_type,
             selected_skills=selected_skills,
+            resolved_skill_profiles=resolved_skill_profiles,
+            group_memory_attached=bool(group_injection and group_injection.memory_context),
         )
 
-        task = self._build_task_prompt(request, task_type, selected_skills)
-        solutions = await self._collect_solutions(agents, task, emit, task_type)
-        agent_outputs = [self._solution_to_output(sol, task_type) for sol in solutions]
+        await emit(
+            "normalized_data_ready",
+            providers=normalized_market_data.get("providers", {}),
+            provider_status=normalized_market_data.get("provider_status", {}),
+            provider_signals=normalized_market_data.get("provider_signals", []),
+            has_news=bool(normalized_market_data.get("news")),
+        )
+
+        task = self._build_task_prompt(request, task_type, selected_skills, normalized_market_data, group_injection)
+        solutions = await self._collect_solutions(
+            agents,
+            request,
+            task_type,
+            selected_skills,
+            normalized_market_data,
+            group_injection,
+            emit,
+        )
+        panel_roles = self._panel_roles_for_task(task_type)
+        agent_outputs = [
+            self._solution_to_output(
+                sol,
+                task_type,
+                role=(panel_roles[index] if index < len(panel_roles) else None),
+            )
+            for index, sol in enumerate(solutions)
+        ]
 
         recommendation, summary = self._merge_outputs(agent_outputs)
-        bull_case, bear_case = self._build_bull_bear_cases(summary, agent_outputs)
-        catalysts = self._build_catalysts(request)
+        external_evidence = self._build_external_evidence(normalized_market_data)
+        bull_case, bear_case = self._build_bull_bear_cases(summary, agent_outputs, external_evidence)
+        catalysts = self._build_catalysts(request, external_evidence)
         scenarios = self._build_scenarios(recommendation)
         disagreement_summary = self._build_disagreement_summary(summary, agent_outputs)
 
@@ -396,7 +611,7 @@ class InvestmentAnalysisService:
         )
 
         await emit("risk_gate_started")
-        risk_gate = await self._evaluate_risk(request, recommendation)
+        risk_gate = await self._evaluate_risk(request, recommendation, group_injection)
         await emit(
             "risk_gate_finished",
             status=risk_gate.status,
@@ -410,6 +625,7 @@ class InvestmentAnalysisService:
             agent_outputs,
             consensus_view,
             risk_gate,
+            external_evidence,
         )
         completed_at = _utc_now()
         metadata = InvestmentMetadata(
@@ -417,8 +633,14 @@ class InvestmentAnalysisService:
             latency_ms=int((time.time() - started) * 1000),
             data_sources=data_sources,
             selected_skills=selected_skills,
+            resolved_skill_profiles=resolved_skill_profiles,
+            panel_roles=panel_roles,
+            panel_role_skills=panel_role_skills,
+            panel_role_data_focus=panel_role_data_focus,
             task_type=task_type,
             constraints_applied_summary=constraints_summary,
+            provider_status=normalized_market_data.get("provider_status", {}),
+            provider_signals=normalized_market_data.get("provider_signals", []),
             created_at=created_at,
             completed_at=completed_at,
             event_count=event_count,
@@ -427,7 +649,8 @@ class InvestmentAnalysisService:
                 "used_roundtable": consensus_view.enabled,
                 "used_constraints": bool(request.constraints or request.portfolio_context),
                 "used_risk_gate": True,
-                "used_external_news": False,
+                "used_external_news": bool(normalized_market_data.get("news")),
+                "used_group_knowledge": bool(group_injection),
             },
         )
 
@@ -492,45 +715,90 @@ class InvestmentAnalysisService:
         if not all_agents:
             return []
 
+        panel_roles = self._panel_roles_for_task(task_type)
+        role_specific_agents: List[Agent] = []
+        used_agent_ids = set()
+
+        for role in panel_roles:
+            ranked_for_role = sorted(
+                all_agents,
+                key=lambda a: a.get_weight_for_task(role),
+                reverse=True,
+            )
+            for candidate in ranked_for_role:
+                if candidate.agent_id in used_agent_ids:
+                    continue
+                role_specific_agents.append(candidate)
+                used_agent_ids.add(candidate.agent_id)
+                break
+
         ranked = sorted(
             all_agents,
             key=lambda a: a.get_weight_for_task(task_type),
             reverse=True,
         )
+        ordered_agents = role_specific_agents + [
+            agent for agent in ranked if agent.agent_id not in used_agent_ids
+        ]
 
         if mode == InvestmentMode.FAST:
-            return ranked[:1]
+            return ordered_agents[:1]
         if mode == InvestmentMode.AUTO:
-            return ranked[:2]
+            return ordered_agents[: min(max(2, len(panel_roles)), len(ordered_agents))]
         if mode == InvestmentMode.COLLABORATE:
-            return ranked[: min(4, len(ranked))]
-        return ranked[: min(5, len(ranked))]
+            return ordered_agents[: min(max(4, len(panel_roles)), len(ordered_agents))]
+        return ordered_agents[: min(max(5, len(panel_roles)), len(ordered_agents))]
 
     async def _collect_solutions(
         self,
         agents: List[Agent],
-        task: str,
-        emit: Callable[..., Awaitable[None]],
+        request: InvestmentAnalysisRequest,
         task_type: str,
+        selected_skills: List[str],
+        normalized_market_data: Dict[str, Any],
+        group_injection: Optional[GroupKnowledgeInjection],
+        emit: Callable[..., Awaitable[None]],
     ) -> List[Solution]:
         if not agents:
             return []
 
-        async def _run(agent: Agent) -> Tuple[Agent, Any]:
+        async def _run(agent: Agent, agent_task: str) -> Tuple[Agent, Any]:
             try:
-                result = await agent.generate_solution(task)
+                result = await agent.generate_solution(agent_task)
                 return agent, result
             except Exception as exc:
                 return agent, exc
 
-        tasks = [asyncio.create_task(_run(agent)) for agent in agents]
+        panel_roles = self._panel_roles_for_task(task_type)
+        tasks = []
+        for index, agent in enumerate(agents):
+            agent_role = panel_roles[index] if index < len(panel_roles) else self._role_for_task_type(task_type)
+            role_skills = self._skills_for_role(agent_role, selected_skills)
+            tasks.append(
+                asyncio.create_task(
+                    _run(
+                        agent,
+                        self._build_task_prompt(
+                            request,
+                            task_type,
+                            role_skills,
+                            normalized_market_data,
+                            group_injection,
+                            agent_role=agent_role,
+                            agent_id=agent.agent_id,
+                        ),
+                    )
+                )
+            )
+
         solutions: List[Solution] = []
 
-        for agent in agents:
+        for index, agent in enumerate(agents):
+            agent_role = panel_roles[index] if index < len(panel_roles) else self._role_for_task_type(task_type)
             await emit(
                 "agent_started",
                 agent_id=agent.agent_id,
-                role=self._role_for_task_type(task_type),
+                role=agent_role,
             )
 
         for done_task in asyncio.as_completed(tasks):
@@ -565,20 +833,150 @@ class InvestmentAnalysisService:
         request: InvestmentAnalysisRequest,
         task_type: str,
         selected_skills: List[str],
+        normalized_market_data: Dict[str, Any],
+        group_injection: Optional[GroupKnowledgeInjection] = None,
+        agent_role: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ) -> str:
         facts = "\n".join(f"- {f}" for f in request.public_facts[:10])
         facts = facts or "- No extra public facts provided"
         skill_lines = "\n".join(f"- {s}" for s in selected_skills) or "- generic_analysis"
+        effective_role = agent_role or self._role_for_task_type(task_type)
+        role_title = _TITLE_BY_ROLE.get(effective_role, "Investment Analysis Agent")
+        normalized_context = self._format_normalized_data_for_prompt(
+            normalized_market_data,
+            effective_role,
+        )
+
+        group_context = ""
+        if group_injection:
+            extras = []
+            if group_injection.memory_context:
+                extras.append(group_injection.memory_context)
+            if group_injection.skill_descriptions:
+                extras.append("Group skill registry:\n" + "\n".join(f"- {item}" for item in group_injection.skill_descriptions[:8]))
+            if group_injection.document_summaries:
+                extras.append("Group shared documents:\n" + "\n".join(f"- {item}" for item in group_injection.document_summaries[:6]))
+            if group_injection.historical_case_ids:
+                extras.append("Group historical cases:\n" + "\n".join(f"- {item}" for item in group_injection.historical_case_ids[:6]))
+            if group_injection.graph_ids:
+                extras.append("Relevant knowledge graphs:\n" + "\n".join(f"- {item}" for item in group_injection.graph_ids[:5]))
+            if extras:
+                group_context = "\n\nGroup shared knowledge context:\n" + "\n\n".join(extras)
+
+        provider_status = normalized_market_data.get("provider_status") or {}
+        provider_signals = self._collect_provider_signals(provider_status)
 
         return (
-            f"You are an investment analyst. Analyze {request.asset.symbol} "
+            f"You are {role_title}. Agent ID: {agent_id or 'shared_agent'}. Analyze {request.asset.symbol} "
             f"({request.asset.market.value}, {request.asset.asset_type.value}) with horizon {request.timeframe.horizon}.\n"
             f"Task type: {task_type}.\n"
+            f"Agent focus: {effective_role}.\n"
             f"Risk profile: {request.risk_profile}. Objective: {request.objective}.\n"
             f"Required skills:\n{skill_lines}\n"
             f"Market snapshot: {request.market_snapshot or 'N/A'}\n"
             f"Facts:\n{facts}\n"
-            "Output concise recommendation with one of BUY/HOLD/SELL/WATCH and key reasons."
+            f"Provider status summary:\n{self._format_provider_status_for_prompt(provider_status)}\n"
+            f"Provider signals: {', '.join(provider_signals) if provider_signals else 'none'}\n"
+            f"Normalized external data:\n{normalized_context}"
+            f"{group_context}\n"
+            "Prioritize the data most relevant to your role. If key provider data is unavailable or degraded, explicitly mention the data gap and lower confidence accordingly. Output concise recommendation with one of BUY/HOLD/SELL/WATCH and key reasons."
+        )
+
+    async def _fetch_normalized_asset_data(
+        self,
+        request: InvestmentAnalysisRequest,
+    ) -> Dict[str, Any]:
+        return await self.data_gateway.fetch_all(
+            request.asset.symbol,
+            request.asset.market.value,
+            request.asset.asset_type.value,
+        )
+
+    @staticmethod
+    def _format_provider_status_for_prompt(provider_status: Dict[str, Any]) -> str:
+        if not provider_status:
+            return "- No provider status available"
+        lines = []
+        for provider, status in provider_status.items():
+            if not isinstance(status, dict):
+                lines.append(f"- {provider}: unknown")
+                continue
+            lines.append(
+                f"- {provider}: status={status.get('status', 'unknown')}; "
+                f"signals={', '.join(status.get('signals', [])) or 'none'}; "
+                f"message={status.get('message', '') or 'ok'}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _collect_provider_signals(provider_status: Dict[str, Any]) -> List[str]:
+        signals: List[str] = []
+        for status in provider_status.values():
+            if isinstance(status, dict):
+                signals.extend(str(item) for item in status.get("signals", []) if str(item).strip())
+        return sorted(set(signals))
+
+    @staticmethod
+    def _format_normalized_data_for_prompt(
+        normalized_market_data: Dict[str, Any],
+        role: Optional[str] = None,
+    ) -> str:
+        sections = []
+        market = normalized_market_data.get("market") or {}
+        fundamentals = normalized_market_data.get("fundamentals") or {}
+        news = normalized_market_data.get("news") or []
+        focus = _ROLE_DATA_FOCUS.get(role or "investment_specialist", ["market", "fundamentals", "news"])
+
+        if "market" in focus and market:
+            sections.append("Market data:\n" + "\n".join(f"- {key}: {value}" for key, value in market.items()))
+        if "fundamentals" in focus and fundamentals:
+            sections.append(
+                "Fundamental data:\n" + "\n".join(f"- {key}: {value}" for key, value in fundamentals.items())
+            )
+        if "news" in focus and news:
+            sections.append(
+                "News:\n"
+                + "\n".join(
+                    f"- {item.get('title')} | source={item.get('source', '')} | polarity={item.get('polarity', 'neutral')}"
+                    if isinstance(item, dict)
+                    else f"- {item}"
+                    for item in news[:5]
+                )
+            )
+        if not sections:
+            return "- No normalized external data available"
+        return "\n\n".join(sections)
+
+    async def _build_group_knowledge_injection(
+        self,
+        request: InvestmentAnalysisRequest,
+        task_type: str,
+    ) -> Optional[GroupKnowledgeInjection]:
+        if not self.group_service:
+            return None
+
+        group_id = (
+            request.metadata.get("group_id")
+            or request.metadata.get("knowledge_group_id")
+        )
+        if not group_id:
+            return None
+
+        query = request.custom_question or (
+            f"{request.asset.symbol} {request.asset.asset_type.value} {task_type} {request.timeframe.horizon}"
+        )
+        categories = sorted(
+            {
+                category
+                for profile in self._resolve_skill_profiles(self._selected_skills_for_asset(request.asset.asset_type))
+                for category in profile.get("categories", [])
+            }
+        )
+        return await self.group_service.build_group_knowledge_injection(
+            group_id=group_id,
+            query=query,
+            categories=categories,
         )
 
     @staticmethod
@@ -590,6 +988,22 @@ class InvestmentAnalysisService:
         return _ASSET_SKILLS.get(asset_type, ["general_investment_analysis"])
 
     @staticmethod
+    def _resolve_skill_profiles(selected_skills: List[str]) -> List[Dict[str, Any]]:
+        profiles: List[Dict[str, Any]] = []
+        for skill_id in selected_skills:
+            profile = _SKILL_PROFILES.get(skill_id, {})
+            profiles.append(
+                {
+                    "skill_id": skill_id,
+                    "name": profile.get("name", skill_id),
+                    "description": profile.get("description", ""),
+                    "categories": profile.get("categories", []),
+                    "required_data_sources": profile.get("required_data_sources", []),
+                }
+            )
+        return profiles
+
+    @staticmethod
     def _asset_data_sources_for(asset_type: AssetType) -> List[str]:
         return _ASSET_DATA_SOURCES.get(asset_type, ["public_market_data"])
 
@@ -597,14 +1011,33 @@ class InvestmentAnalysisService:
     def _role_for_task_type(task_type: str) -> str:
         return _ROLE_BY_TASK_TYPE.get(task_type, "investment_specialist")
 
-    def _solution_to_output(self, solution: Solution, task_type: str) -> AgentOutput:
+    @staticmethod
+    def _panel_roles_for_task(task_type: str) -> List[str]:
+        if task_type == "equity_analysis":
+            return list(_EQUITY_PANEL_ROLES)
+        return [InvestmentAnalysisService._role_for_task_type(task_type)]
+
+    @staticmethod
+    def _skills_for_role(role: str, selected_skills: List[str]) -> List[str]:
+        focused = _ROLE_SKILL_FOCUS.get(role)
+        if not focused:
+            return selected_skills
+        matched = [skill for skill in selected_skills if skill in focused]
+        return matched or selected_skills
+
+    def _solution_to_output(
+        self,
+        solution: Solution,
+        task_type: str,
+        role: Optional[str] = None,
+    ) -> AgentOutput:
         signal = self._extract_signal(solution.answer)
         evidence = [ln.strip() for ln in solution.answer.split("\n") if ln.strip()][:3]
-        role = self._role_for_task_type(task_type)
+        effective_role = role or self._role_for_task_type(task_type)
         return AgentOutput(
             agent_id=solution.agent_id,
-            role=role,
-            title=_TITLE_BY_ROLE.get(role, "Investment Analysis Agent"),
+            role=effective_role,
+            title=_TITLE_BY_ROLE.get(effective_role, "Investment Analysis Agent"),
             signal=signal,
             stance=_SIGNAL_TO_STANCE.get(signal, "review"),
             confidence=max(0.0, min(solution.confidence, 1.0)),
@@ -767,12 +1200,14 @@ class InvestmentAnalysisService:
             await emit(
                 "round_started",
                 round_number=round_info.round_number,
+                stage=round_info.stage,
                 candidate_action=round_info.candidate_action,
             )
             for agent_entry in round_info.agents:
                 await emit(
                     "agent_replied_in_round",
                     round_number=round_info.round_number,
+                    stage=round_info.stage,
                     agent_id=agent_entry.agent_id,
                     stance=agent_entry.stance,
                     current_signal=agent_entry.current_signal,
@@ -781,6 +1216,7 @@ class InvestmentAnalysisService:
             await emit(
                 "round_completed",
                 round_number=round_info.round_number,
+                stage=round_info.stage,
                 candidate_action=round_info.candidate_action,
                 candidate_confidence=round_info.candidate_confidence,
             )
@@ -803,7 +1239,7 @@ class InvestmentAnalysisService:
         if not agent_outputs:
             return ConsensusTrace(discussion_enabled=False)
 
-        first_round_agents = [
+        initial_round_agents = [
             DiscussionAgentEntry(
                 agent_id=output.agent_id,
                 role=output.role,
@@ -811,11 +1247,31 @@ class InvestmentAnalysisService:
                 current_signal=output.signal,
                 changed_position=False,
                 summary=output.summary,
-                message=output.summary,
+                message=f"[{output.role}] {output.summary}",
                 evidence=output.evidence,
             )
             for output in agent_outputs
         ]
+
+        challenge_round_agents = [
+            DiscussionAgentEntry(
+                agent_id=output.agent_id,
+                role=output.role,
+                stance="challenge" if output.signal != self._signal_for_action(final_action) else "defend",
+                previous_signal=output.signal,
+                current_signal=output.signal,
+                changed_position=False,
+                summary=f"{output.role} reviews the committee draft against its own lens.",
+                message=(
+                    f"[{output.role}] Challenge the draft recommendation on {', '.join(output.risks_flagged[:2])}."
+                    if output.risks_flagged
+                    else f"[{output.role}] Stress-test whether the draft {final_action} call is justified."
+                ),
+                evidence=output.evidence,
+            )
+            for output in agent_outputs
+        ]
+
         final_signal = self._signal_for_action(final_action)
         final_round_agents = [
             DiscussionAgentEntry(
@@ -826,14 +1282,14 @@ class InvestmentAnalysisService:
                 current_signal=final_signal,
                 changed_position=output.signal != final_signal,
                 summary=(
-                    f"Aligned to final {final_action} recommendation."
+                    f"{output.role} aligns to the final {final_action} committee recommendation."
                     if output.signal != final_signal
                     else output.summary
                 ),
                 message=(
-                    f"Adjusted view to {final_action}."
+                    f"[{output.role}] Adjusted view to {final_action} after committee challenge round."
                     if output.signal != final_signal
-                    else output.summary
+                    else f"[{output.role}] Supports the final {final_action} recommendation."
                 ),
                 evidence=output.evidence,
             )
@@ -843,24 +1299,37 @@ class InvestmentAnalysisService:
         rounds = [
             DiscussionRound(
                 round_number=1,
+                stage="opening_statements",
                 candidate_action=_ACTION_BY_SIGNAL.get(agent_outputs[0].signal, RecommendationAction.HOLD).value,
                 candidate_confidence=max(agent_outputs[0].confidence, 0.0),
-                agents=first_round_agents,
-                agreement_points=["Initial views collected from participating agents."],
-                disagreement_points=["Signals are not yet aligned across all agents."],
+                agents=initial_round_agents,
+                agreement_points=["Committee opening statements collected from each role-specific panelist."],
+                disagreement_points=["Initial role-based views still point to different actions or risk emphases."],
             ),
             DiscussionRound(
                 round_number=2,
+                stage="cross_challenge",
+                candidate_action=final_action,
+                candidate_confidence=max(final_confidence * 0.9, 0.0),
+                agents=challenge_round_agents,
+                agreement_points=["Panelists pressure-tested the draft recommendation across valuation, macro, and risk lenses."],
+                disagreement_points=["Some panelists requested revisions before committee convergence."],
+            ),
+            DiscussionRound(
+                round_number=3,
+                stage="chair_synthesis",
                 candidate_action=final_action,
                 candidate_confidence=final_confidence,
                 agents=final_round_agents,
-                agreement_points=[f"Consensus moved toward {final_action}."],
+                agreement_points=[f"Committee chair synthesized the panel into a final {final_action} stance."],
                 disagreement_points=[],
             ),
         ]
         return ConsensusTrace(
             discussion_enabled=True,
-            final_summary=f"Agents converged on {final_action} after weighing different signals.",
+            final_summary=(
+                f"Investment committee completed opening statements, cross-challenge, and chair synthesis before settling on {final_action}."
+            ),
             rounds=rounds,
         )
 
@@ -878,6 +1347,11 @@ class InvestmentAnalysisService:
         task_type: str,
         selected_skills: List[str],
         data_sources: List[str],
+        resolved_skill_profiles: List[Dict[str, Any]],
+        group_injection: Optional[GroupKnowledgeInjection],
+        panel_roles: List[str],
+        panel_role_skills: Dict[str, List[str]],
+        panel_role_data_focus: Dict[str, List[str]],
     ) -> AnalysisFramework:
         why_selected = [
             f"Detected {task_type} task.",
@@ -885,29 +1359,66 @@ class InvestmentAnalysisService:
         ]
         if mode == InvestmentMode.ROUNDTABLE:
             why_selected.append("Roundtable mode enabled consensus synthesis.")
+        if group_injection:
+            why_selected.append(
+                f"Attached group shared knowledge from {group_injection.group_id} with {len(group_injection.skill_descriptions)} skills and {len(group_injection.graph_ids)} graphs."
+            )
+        if panel_roles:
+            why_selected.append(
+                "Investment committee panel active: " + ", ".join(panel_roles)
+            )
         return AnalysisFramework(
             style="multi_agent_investment_review",
             task_type=task_type,
             selected_skills=selected_skills,
+            resolved_skill_profiles=resolved_skill_profiles,
             data_sources=data_sources,
+            panel_roles=panel_roles,
+            panel_role_skills=panel_role_skills,
+            panel_role_data_focus=panel_role_data_focus,
             why_selected=why_selected,
         )
+
+    @staticmethod
+    def _build_external_evidence(normalized_market_data: Dict[str, Any]) -> Dict[str, List[str]]:
+        news = [str(item).strip() for item in (normalized_market_data.get("news") or []) if str(item).strip()]
+        provider_signals = [
+            str(item).strip() for item in (normalized_market_data.get("provider_signals") or []) if str(item).strip()
+        ]
+        supporting = news[:3]
+        negative = []
+        for item in news:
+            lower = item.lower()
+            if any(token in lower for token in ["risk", "warn", "fall", "drop", "probe", "lawsuit", "cut", "weak"]):
+                negative.append(item)
+        if not negative:
+            negative = provider_signals[:2]
+        return {
+            "supporting": supporting,
+            "negative": negative[:3],
+            "organizations": [item.split(" - ")[0] for item in news[:3] if " - " in item],
+        }
 
     @staticmethod
     def _build_bull_bear_cases(
         summary: InvestmentSummary,
         outputs: List[AgentOutput],
+        external_evidence: Dict[str, List[str]],
     ) -> Tuple[List[str], List[str]]:
         bull_case = [o.summary for o in outputs if o.signal == "bullish"][:3]
         bear_case = [o.summary for o in outputs if o.signal == "bearish"][:3]
         if not bull_case:
             bull_case = summary.key_drivers[:2]
+        if external_evidence.get("supporting"):
+            bull_case.extend(external_evidence.get("supporting", [])[:2])
         if not bear_case:
             bear_case = summary.key_risks[:2]
-        return bull_case, bear_case
+        if external_evidence.get("negative"):
+            bear_case.extend(external_evidence.get("negative", [])[:2])
+        return bull_case[:4], bear_case[:4]
 
-    def _build_catalysts(self, request: InvestmentAnalysisRequest) -> List[CatalystItem]:
-        return [
+    def _build_catalysts(self, request: InvestmentAnalysisRequest, external_evidence: Dict[str, List[str]]) -> List[CatalystItem]:
+        catalysts = [
             CatalystItem(
                 name=f"{request.asset.symbol} next earnings or major update",
                 direction="two_way",
@@ -915,6 +1426,16 @@ class InvestmentAnalysisService:
                 time_horizon=request.timeframe.horizon,
             )
         ]
+        for headline in external_evidence.get("supporting", [])[:2]:
+            catalysts.append(
+                CatalystItem(
+                    name=headline,
+                    direction="positive",
+                    importance="medium",
+                    time_horizon=request.timeframe.horizon,
+                )
+            )
+        return catalysts[:3]
 
     @staticmethod
     def _build_scenarios(recommendation: InvestmentRecommendation) -> List[ScenarioItem]:
@@ -966,6 +1487,7 @@ class InvestmentAnalysisService:
         self,
         request: InvestmentAnalysisRequest,
         recommendation: InvestmentRecommendation,
+        group_injection: Optional[GroupKnowledgeInjection] = None,
     ) -> RiskGateResult:
         if not self.risk_coordinator:
             return RiskGateResult(
@@ -979,6 +1501,18 @@ class InvestmentAnalysisService:
         amount = float((request.constraints or {}).get("notional_amount", 0.0))
         if amount <= 0:
             amount = 10_000 * exposure
+
+        trace_context = request.custom_question
+        if group_injection:
+            extras = []
+            if group_injection.memory_context:
+                extras.append(group_injection.memory_context)
+            if group_injection.skill_descriptions:
+                extras.append("group_skills=" + "; ".join(group_injection.skill_descriptions[:6]))
+            if group_injection.graph_ids:
+                extras.append("graph_ids=" + ", ".join(group_injection.graph_ids[:5]))
+            if extras:
+                trace_context = "\n\n".join([item for item in [trace_context, *extras] if item])
 
         rr = RiskRequest(
             subject=RiskSubject(
@@ -994,10 +1528,14 @@ class InvestmentAnalysisService:
                 ),
                 amount=amount,
                 currency=(request.constraints or {}).get("currency", "USD"),
-                trace_context=request.custom_question,
+                trace_context=trace_context,
             ),
             priority="normal",
-            metadata={"investment_mode": request.mode.value},
+            metadata={
+                "investment_mode": request.mode.value,
+                "group_id": group_injection.group_id if group_injection else None,
+                "group_graph_ids": (group_injection.graph_ids if group_injection else []),
+            },
         )
 
         decision = await self.risk_coordinator.evaluate(rr)
@@ -1027,6 +1565,7 @@ class InvestmentAnalysisService:
         outputs: List[AgentOutput],
         consensus: ConsensusResultView,
         risk_gate: RiskGateResult,
+        external_evidence: Dict[str, List[str]],
     ) -> str:
         lines = [
             f"# Investment Analysis: {request.asset.symbol}",
@@ -1035,6 +1574,12 @@ class InvestmentAnalysisService:
             f"- Market: {request.asset.market.value}",
             f"- Asset Type: {request.asset.asset_type.value}",
             f"- Horizon: {request.timeframe.horizon}",
+            "",
+            "## Investment Committee Panel",
+        ]
+        committee_roles = [out.role for out in outputs if out.role]
+        lines.extend([f"- {role}" for role in committee_roles] or ["- N/A"])
+        lines.extend([
             "",
             "## Recommendation",
             f"- Action: **{recommendation.action.value.upper()}**",
@@ -1045,10 +1590,14 @@ class InvestmentAnalysisService:
             summary.thesis,
             "",
             "## Key Drivers",
-        ]
+        ])
         lines.extend([f"- {d}" for d in summary.key_drivers] or ["- N/A"])
         lines.extend(["", "## Key Risks"])
         lines.extend([f"- {r}" for r in summary.key_risks] or ["- N/A"])
+
+        lines.extend(["", "## External Evidence"])
+        lines.extend([f"- Supporting: {item}" for item in external_evidence.get("supporting", [])] or ["- Supporting: N/A"])
+        lines.extend([f"- Negative: {item}" for item in external_evidence.get("negative", [])] or ["- Negative: N/A"])
 
         lines.extend(["", "## Agent Outputs"])
         if outputs:
