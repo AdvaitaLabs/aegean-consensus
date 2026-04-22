@@ -45,6 +45,7 @@ class CoinGeckoProvider(ExternalDataProvider):
         headers = {"accept": "application/json"}
         if self.api_key:
             headers["x-cg-demo-api-key"] = self.api_key
+            headers["x-cg-pro-api-key"] = self.api_key
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:

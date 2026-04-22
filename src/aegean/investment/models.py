@@ -226,6 +226,10 @@ class InvestmentAnalysisRequest(BaseModel):
     private_context_refs: List[str] = Field(default_factory=list)
 
     user_id: str = Field("anonymous")
+    extended_roles: List[str] = Field(
+        default_factory=list,
+        description="Optional lens roles to augment the panel (e.g. macro_enhanced, event_driven).",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -254,4 +258,8 @@ class InvestmentAnalysisResponse(BaseModel):
     report_markdown: str = ""
     external_evidence_nodes: List[ExternalEvidenceNode] = Field(default_factory=list)
     external_news_items: List[ExternalNewsItem] = Field(default_factory=list)
+    agent_graph: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Serialized discussion graph (nodes/edges) for frontend rendering.",
+    )
     metadata: InvestmentMetadata = Field(default_factory=InvestmentMetadata)

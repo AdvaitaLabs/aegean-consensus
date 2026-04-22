@@ -13,17 +13,18 @@ _DEFAULT_PROVIDER_TIMEOUTS = {
     "tavily": 6.0,
     "exa": 6.0,
     "serpapi": 6.0,
+    "scrape_creators": 6.0,
 }
 
 _ASSET_PROVIDER_ORDER = {
-    "equity": ["market", "fundamentals", "news", "search", "search_fallback", "search_fallback_2"],
-    "etf": ["market", "fundamentals", "news", "search", "search_fallback", "search_fallback_2"],
-    "index": ["market", "news", "search", "search_fallback", "search_fallback_2"],
+    "equity": ["market", "fundamentals", "news", "search", "search_fallback", "social_search"],
+    "etf": ["market", "fundamentals", "news", "search", "search_fallback", "social_search"],
+    "index": ["market", "news", "search", "search_fallback", "social_search"],
     "fund": ["market", "fundamentals", "news", "search"],
     "convertible_bond": ["market", "fundamentals", "news", "search"],
-    "futures": ["market", "news", "search", "search_fallback", "search_fallback_2"],
+    "futures": ["market", "news", "search", "search_fallback", "social_search"],
     "options": ["market", "news", "search"],
-    "crypto": ["market", "news", "search", "search_fallback", "search_fallback_2"],
+    "crypto": ["market", "news", "search", "search_fallback", "social_search"],
 }
 
 

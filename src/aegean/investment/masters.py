@@ -113,20 +113,73 @@ MASTER_PERSONAS: Dict[str, MasterPersona] = {
             "works; quick to size up on drawdowns when the thesis is intact."
         ),
     ),
+    "dalio": MasterPersona(
+        key="dalio",
+        display_name="Ray Dalio",
+        philosophy=(
+            "Think in terms of machines and regimes. Diversify across "
+            "uncorrelated return streams; size positions by expected risk "
+            "contribution rather than conviction. Principles > predictions."
+        ),
+        signature_lens=(
+            "growth/inflation regime quadrant, real yields, credit cycle "
+            "position, currency regime, and the risk-parity contribution "
+            "of this asset to the current portfolio."
+        ),
+        output_bias=(
+            "Refuse concentrated bets on single names; prefer exposures that "
+            "pay off in multiple macro regimes; reject theses that rely on a "
+            "single policy or political outcome."
+        ),
+    ),
+    "soros": MasterPersona(
+        key="soros",
+        display_name="George Soros",
+        philosophy=(
+            "Markets are reflexive — prices change fundamentals as much as "
+            "fundamentals change prices. Find self-reinforcing loops early, "
+            "press hard when you're right, cut fast when reflexivity reverses."
+        ),
+        signature_lens=(
+            "narrative momentum, policy/regulatory inflection points, "
+            "positioning extremes, currency and rate linkages, and the "
+            "point where the reflexive loop becomes unsustainable."
+        ),
+        output_bias=(
+            "Bold sizing when a reflexive trend is confirmed; ruthless on "
+            "exit when the feedback loop breaks. Suspicious of static "
+            "intrinsic-value theses in macro-sensitive names."
+        ),
+    ),
 }
 
 
+_PERSONA_ALIASES: Dict[str, str] = {
+    f"{key}_style": key for key in MASTER_PERSONAS
+}
+
+
+def _normalize_persona_key(key: str) -> str:
+    if not key:
+        return key
+    canonical = _PERSONA_ALIASES.get(key.strip().lower())
+    return canonical or key.strip().lower()
+
+
 def get_persona(key: str) -> MasterPersona:
+    normalized = _normalize_persona_key(key)
     try:
-        return MASTER_PERSONAS[key]
+        return MASTER_PERSONAS[normalized]
     except KeyError as exc:
         raise ValueError(
             f"Unknown master persona '{key}'. "
-            f"Known: {sorted(MASTER_PERSONAS)}"
+            f"Known: {sorted(MASTER_PERSONAS)} (aliases accept '<key>_style')"
         ) from exc
 
 
-def available_personas() -> List[str]:
+def available_personas(include_aliases: bool = False) -> List[str]:
+    if include_aliases:
+        return list(MASTER_PERSONAS.keys()) + list(_PERSONA_ALIASES.keys())
     return list(MASTER_PERSONAS.keys())
 
 

@@ -495,55 +495,84 @@ class GlobalMemorySystem:
         return recommendations
     
     async def export_knowledge_base(self, output_path: str) -> int:
-        """
-        Export knowledge base to file.
-        
-        Args:
-            output_path: Path to output file
-            
-        Returns:
-            Number of documents exported
-        """
+        """Export in-memory knowledge base docs to a JSON file."""
         import json
-        
-        # Get all documents (implementation depends on backend)
-        # For now, just return count
-        stats = self.knowledge_base.get_stats()
-        return stats.get("total_documents", 0)
-    
+        from pathlib import Path
+
+        docs = getattr(self.knowledge_base, "_documents", {}) or {}
+        payload = []
+        for doc_id, doc in docs.items():
+            payload.append(
+                {
+                    "doc_id": doc_id,
+                    "content": doc.content,
+                    "category": doc.category,
+                    "metadata": doc.metadata,
+                }
+            )
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return len(payload)
+
     async def import_knowledge_base(self, input_path: str) -> int:
-        """
-        Import knowledge base from file.
-        
-        Args:
-            input_path: Path to input file
-            
-        Returns:
-            Number of documents imported
-        """
+        """Import documents from a JSON file produced by :meth:`export_knowledge_base`."""
         import json
-        
-        # TODO: Implement import logic
-        return 0
-    
+        from pathlib import Path
+
+        path = Path(input_path)
+        if not path.exists():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return 0
+        if not isinstance(payload, list):
+            return 0
+
+        count = 0
+        for entry in payload:
+            if not isinstance(entry, dict) or "content" not in entry:
+                continue
+            await self.knowledge_base.add_document(
+                content=entry["content"],
+                category=entry.get("category", "imported"),
+                metadata=entry.get("metadata") or {},
+                doc_id=entry.get("doc_id"),
+            )
+            count += 1
+        return count
+
     async def clear_old_data(self, days: int = 90) -> Dict[str, int]:
-        """
-        Clear old data from experience base.
-        
-        Args:
-            days: Keep data from last N days
-            
-        Returns:
-            Dictionary with counts of deleted records
-        """
+        """Drop in-memory consensus/feedback records older than ``days``."""
         from datetime import timedelta
-        
-        cutoff_date = datetime.utcnow() - timedelta(days=days)
-        
-        # TODO: Implement deletion logic
-        # For now, return empty counts
+
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        consensus_deleted = 0
+        feedback_deleted = 0
+
+        consensus_store = getattr(self.experience_base, "_consensus_records", None)
+        if isinstance(consensus_store, dict):
+            stale = [
+                cid for cid, rec in consensus_store.items()
+                if getattr(rec, "timestamp", datetime.utcnow()) < cutoff
+            ]
+            for cid in stale:
+                consensus_store.pop(cid, None)
+            consensus_deleted = len(stale)
+
+        feedback_store = getattr(self.experience_base, "_feedback_records", None)
+        if isinstance(feedback_store, dict):
+            stale = [
+                fid for fid, rec in feedback_store.items()
+                if getattr(rec, "timestamp", datetime.utcnow()) < cutoff
+            ]
+            for fid in stale:
+                feedback_store.pop(fid, None)
+            feedback_deleted = len(stale)
+
         return {
-            "consensus_records_deleted": 0,
-            "feedback_records_deleted": 0
+            "consensus_records_deleted": consensus_deleted,
+            "feedback_records_deleted": feedback_deleted,
         }
 

@@ -10,8 +10,15 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from aegean.core.agent import AgentRegistry
+from aegean.investment.masters import MASTER_PERSONAS
 from aegean.investment.models import InvestmentAnalysisRequest, InvestmentAnalysisResponse
-from aegean.investment.service import InvestmentAnalysisService
+from aegean.investment.service import (
+    InvestmentAnalysisService,
+    _EXTENDED_LENS_ROLES,
+    _EQUITY_PANEL_ROLES,
+    _TITLE_BY_ROLE,
+    _ROLE_DATA_FOCUS,
+)
 from aegean.memory.global_memory import GlobalMemorySystem
 from aegean.risk.risk_consensus import RiskConsensusCoordinator
 
@@ -50,6 +57,35 @@ def _get_analysis_run_or_404(service: InvestmentAnalysisService, request_id: str
 
 def _to_sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\\n\\n"
+
+
+@router.get(
+    "/roles/catalog",
+    summary="List base panel roles, extended lens roles, and master personas",
+)
+async def get_roles_catalog() -> dict:
+    def _entry(role: str) -> dict:
+        return {
+            "id": role,
+            "title": _TITLE_BY_ROLE.get(role, role),
+            "data_focus": list(_ROLE_DATA_FOCUS.get(role, [])),
+        }
+
+    return {
+        "base_panel_roles": [_entry(r) for r in _EQUITY_PANEL_ROLES],
+        "extended_lens_roles": [_entry(r) for r in sorted(_EXTENDED_LENS_ROLES)],
+        "master_personas": [
+            {
+                "id": persona.key,
+                "alias": f"{persona.key}_style",
+                "display_name": persona.display_name,
+                "philosophy": persona.philosophy,
+                "signature_lens": persona.signature_lens,
+                "output_bias": persona.output_bias,
+            }
+            for persona in MASTER_PERSONAS.values()
+        ],
+    }
 
 
 @router.post(

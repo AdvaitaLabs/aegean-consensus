@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from aegean.core.agent import Agent, AgentRegistry
@@ -50,11 +52,12 @@ from aegean.investment.debate import (
     parse_target_exposure_pct,
 )
 from aegean.investment.masters import (
+    _normalize_persona_key as _normalize_master_key,
     available_personas as _master_available_personas,
     build_master_prompt,
 )
 from aegean.investment.memory import RoleMemoryRegistry
-from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, SerpAPIProvider, TavilyProvider, TushareProvider, YFinanceProvider
+from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, ScrapeCreatorsProvider, TavilyProvider, TushareProvider, YFinanceProvider
 from aegean.investment.providers.gateway import InvestmentDataGateway
 from aegean.investment.risk import PortfolioRiskEngine, PortfolioRiskResult
 from aegean.investment.sentiment import (
@@ -119,6 +122,19 @@ _ROLE_DATA_FOCUS = {
     "crypto_specialist": ["market", "news"],
     "risk_specialist": ["news", "market"],
     "investment_specialist": ["market", "fundamentals", "news"],
+    "macro_enhanced": ["market", "news", "fundamentals"],
+    "risk_enhanced": ["news", "market", "fundamentals"],
+    "event_driven": ["news", "market"],
+    "sentiment_focus": ["news"],
+    "portfolio_view": ["market", "fundamentals"],
+}
+
+_EXTENDED_LENS_ROLES = {
+    "macro_enhanced",
+    "risk_enhanced",
+    "event_driven",
+    "sentiment_focus",
+    "portfolio_view",
 }
 
 _ROLE_SKILL_FOCUS = {
@@ -146,6 +162,11 @@ _TITLE_BY_ROLE = {
     "risk_neutral": "Neutral Risk Analyst",
     "risk_conservative": "Conservative Risk Analyst",
     "chair": "Chair / Portfolio Manager",
+    "macro_enhanced": "Macro Regime Lens",
+    "risk_enhanced": "Risk Stress Lens",
+    "event_driven": "Event / Catalyst Lens",
+    "sentiment_focus": "Sentiment Lens",
+    "portfolio_view": "Portfolio Fit Lens",
 }
 
 _DEBATE_STANCES = ("bull", "bear")
@@ -469,7 +490,9 @@ class InvestmentAnalysisService:
         self.llm_client = llm_client
         self.risk_coordinator = risk_coordinator
         self.group_service = group_service
-        self.role_memory = role_memory or RoleMemoryRegistry()
+        self.role_memory = role_memory or RoleMemoryRegistry(
+            persist_dir=self._resolve_role_memory_persist_dir()
+        )
         self.portfolio_risk_engine = portfolio_risk_engine or PortfolioRiskEngine()
         self.sentiment_pipeline = sentiment_pipeline or SentimentPipeline()
         self.market_data_provider = YFinanceProvider()
@@ -490,7 +513,7 @@ class InvestmentAnalysisService:
                 "news": self.news_data_provider,
                 "search": self.search_data_provider,
                 "search_fallback": self.search_fallback_provider,
-                "search_fallback_2": SerpAPIProvider(),
+                "social_search": ScrapeCreatorsProvider(),
             }
         )
         self.analysis_runs: Dict[str, Dict[str, Any]] = {}
@@ -552,8 +575,9 @@ class InvestmentAnalysisService:
         self._validate_request(request)
         await emit("request_validated")
 
-        agents = self._select_agents(request.mode, task_type)
+        agents = self._select_agents(request.mode, task_type, request.extended_roles)
         panel_roles = self._panel_roles_for_task(task_type)
+        panel_roles = self._apply_extended_roles(panel_roles, request.extended_roles)
         panel_role_skills = {
             role: self._skills_for_role(role, selected_skills)
             for role in panel_roles
@@ -600,7 +624,9 @@ class InvestmentAnalysisService:
             group_injection,
             emit,
         )
-        panel_roles = self._panel_roles_for_task(task_type)
+        panel_roles = self._apply_extended_roles(
+            self._panel_roles_for_task(task_type), request.extended_roles
+        )
         agent_outputs = [
             self._solution_to_output(
                 sol,
@@ -716,6 +742,8 @@ class InvestmentAnalysisService:
             },
         )
 
+        agent_graph = self._build_agent_graph(agent_outputs, consensus_trace)
+
         response = InvestmentAnalysisResponse(
             request_id=request_id,
             status="completed",
@@ -736,6 +764,7 @@ class InvestmentAnalysisService:
             consensus_trace=consensus_trace,
             policy_overrides=policy_overrides,
             report_markdown=report_md,
+            agent_graph=agent_graph,
             metadata=metadata,
         )
         self.analysis_runs[request_id]["status"] = "completed"
@@ -772,12 +801,19 @@ class InvestmentAnalysisService:
                 "equity/etf/index/fund/convertible_bond/futures/options/crypto."
             )
 
-    def _select_agents(self, mode: InvestmentMode, task_type: str) -> List[Agent]:
+    def _select_agents(
+        self,
+        mode: InvestmentMode,
+        task_type: str,
+        extended_roles: Optional[List[str]] = None,
+    ) -> List[Agent]:
         all_agents = self.agent_registry.get_all_agents()
         if not all_agents:
             return []
 
-        panel_roles = self._panel_roles_for_task(task_type)
+        panel_roles = self._apply_extended_roles(
+            self._panel_roles_for_task(task_type), extended_roles or []
+        )
         role_specific_agents: List[Agent] = []
         used_agent_ids = set()
 
@@ -831,7 +867,9 @@ class InvestmentAnalysisService:
             except Exception as exc:
                 return agent, exc
 
-        panel_roles = self._panel_roles_for_task(task_type)
+        panel_roles = self._apply_extended_roles(
+            self._panel_roles_for_task(task_type), request.extended_roles
+        )
         group_id = group_injection.group_id if group_injection else None
         situation_text = self._build_situation_text(request, normalized_market_data)
         agent_context: Dict[str, Dict[str, str]] = {}
@@ -1334,6 +1372,23 @@ class InvestmentAnalysisService:
         return [InvestmentAnalysisService._role_for_task_type(task_type)]
 
     @staticmethod
+    def _resolve_role_memory_persist_dir() -> Optional[Path]:
+        raw = os.environ.get("AEGEAN_ROLE_MEMORY_DIR")
+        if not raw:
+            return None
+        return Path(raw).expanduser()
+
+    @staticmethod
+    def _apply_extended_roles(panel_roles: List[str], extended: List[str]) -> List[str]:
+        if not extended:
+            return panel_roles
+        merged = list(panel_roles)
+        for role in extended:
+            if role in _EXTENDED_LENS_ROLES and role not in merged:
+                merged.append(role)
+        return merged
+
+    @staticmethod
     def _skills_for_role(role: str, selected_skills: List[str]) -> List[str]:
         focused = _ROLE_SKILL_FOCUS.get(role)
         if not focused:
@@ -1710,8 +1765,8 @@ class InvestmentAnalysisService:
             return []
 
         requested = request.metadata.get("master_personas") or list(_DEFAULT_MASTER_PERSONAS)
-        known = set(_master_available_personas())
-        personas = [k for k in requested if k in known]
+        known = set(_master_available_personas(include_aliases=True))
+        personas = [_normalize_master_key(k) for k in requested if k in known]
         if not personas:
             return []
 
@@ -2084,6 +2139,49 @@ class InvestmentAnalysisService:
             action = _ACTION_BY_SIGNAL.get(output.signal, RecommendationAction.HOLD).value
             votes[action] = round(votes.get(action, 0.0) + output.confidence, 4)
         return votes
+
+    def _build_agent_graph(
+        self,
+        agent_outputs: List[AgentOutput],
+        consensus_trace: ConsensusTrace,
+    ) -> Dict[str, Any]:
+        """Serialize a minimal nodes/edges graph for frontend rendering."""
+        nodes: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        for output in agent_outputs:
+            if output.agent_id in seen_ids:
+                continue
+            seen_ids.add(output.agent_id)
+            nodes.append(
+                {
+                    "id": output.agent_id,
+                    "role": output.role,
+                    "title": output.title,
+                    "stance": output.stance,
+                    "signal": output.signal,
+                    "confidence": output.confidence,
+                }
+            )
+
+        edges: List[Dict[str, Any]] = []
+        for rnd in consensus_trace.rounds:
+            entries = rnd.agents
+            for i in range(len(entries)):
+                for j in range(i + 1, len(entries)):
+                    edges.append(
+                        {
+                            "source": entries[i].agent_id,
+                            "target": entries[j].agent_id,
+                            "round": rnd.round_number,
+                            "stage": rnd.stage,
+                        }
+                    )
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "stages": [rnd.stage for rnd in consensus_trace.rounds],
+        }
 
     def _build_consensus_trace(
         self,
