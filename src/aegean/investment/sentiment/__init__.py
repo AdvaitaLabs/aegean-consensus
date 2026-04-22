@@ -3,6 +3,7 @@
 from aegean.investment.sentiment.adapters import (
     finnhub_insider_to_trades,
     news_items_to_articles,
+    tushare_insider_to_trades,
 )
 from aegean.investment.sentiment.pipeline import (
     InsiderTrade,
@@ -24,4 +25,5 @@ __all__ = [
     "classify_news_article",
     "finnhub_insider_to_trades",
     "news_items_to_articles",
+    "tushare_insider_to_trades",
 ]

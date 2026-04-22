@@ -61,6 +61,7 @@ from aegean.investment.sentiment import (
     SentimentPipeline,
     finnhub_insider_to_trades,
     news_items_to_articles,
+    tushare_insider_to_trades,
 )
 
 
@@ -1173,6 +1174,18 @@ class InvestmentAnalysisService:
                     "message": insider_payload.get("message", ""),
                 }
                 insider_trades = finnhub_insider_to_trades(insider_payload.get("data") or [])
+            elif request.asset.market == MarketCode.CN and isinstance(
+                self.cn_market_data_provider, TushareProvider
+            ):
+                insider_payload = await self.cn_market_data_provider.fetch_insider_transactions(
+                    request.asset.symbol
+                )
+                insider_status = {
+                    "status": insider_payload.get("status", "unknown"),
+                    "signals": list(insider_payload.get("signals") or []),
+                    "message": insider_payload.get("message", ""),
+                }
+                insider_trades = tushare_insider_to_trades(insider_payload.get("data") or [])
             if not articles and not insider_trades:
                 return
             result = self.sentiment_pipeline.assess(insider_trades, articles)

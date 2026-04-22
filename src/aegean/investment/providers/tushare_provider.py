@@ -135,6 +135,92 @@ class TushareProvider(ExternalDataProvider):
         except Exception as exc:
             return self._error_result(symbol, market, asset_type, str(exc))
 
+    async def fetch_insider_transactions(
+        self,
+        symbol: str,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Fetch A 股股东增减持（``stk_holdertrade``） as insider-trade rows.
+
+        Returns the same envelope shape as
+        :meth:`FinnhubProvider.fetch_insider_transactions`::
+
+            {"status": "ok|unavailable|timeout|rate_limited|error",
+             "data": [<raw tushare rows>],
+             "signals": [...]}
+
+        Rows include ``in_de`` (``IN``/``DE``), ``change_vol`` and
+        ``holder_name``. Feed them through
+        :func:`aegean.investment.sentiment.tushare_insider_to_trades`.
+        """
+        if not self.api_key:
+            return {
+                "status": "unavailable",
+                "data": [],
+                "signals": ["TUSHARE_INSIDER_UNAVAILABLE"],
+                "message": "Missing TUSHARE_API_KEY",
+            }
+        ts_code = self._normalize_symbol(symbol)
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        payload = {
+            "api_name": "stk_holdertrade",
+            "token": self.api_key,
+            "params": {"ts_code": ts_code, "limit": int(limit)},
+            "fields": "ts_code,ann_date,holder_name,holder_type,in_de,change_vol,change_ratio,avg_price,total_share,begin_date,close_date",
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.pro_url, json=payload) as response:
+                    if response.status == 429:
+                        return {
+                            "status": "rate_limited",
+                            "data": [],
+                            "signals": ["TUSHARE_INSIDER_RATE_LIMITED"],
+                            "message": "Provider rate limited",
+                        }
+                    response.raise_for_status()
+                    body = await response.json()
+            rows = self._rows_from_payload(body)
+            return {
+                "status": "ok",
+                "data": rows,
+                "signals": [],
+                "message": "",
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "timeout",
+                "data": [],
+                "signals": ["TUSHARE_INSIDER_TIMEOUT"],
+                "message": f"Timed out after {self.timeout_seconds}s",
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "data": [],
+                "signals": ["TUSHARE_INSIDER_FAILED"],
+                "message": str(exc),
+            }
+
+    @staticmethod
+    def _rows_from_payload(payload: Any) -> list:
+        if not isinstance(payload, dict):
+            return []
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return []
+        fields = data.get("fields") or []
+        items = data.get("items") or []
+        if not fields or not items:
+            return []
+        rows = []
+        for item in items:
+            if isinstance(item, list):
+                rows.append(dict(zip(fields, item)))
+            elif isinstance(item, dict):
+                rows.append(item)
+        return rows
+
     async def _post(self, session: aiohttp.ClientSession, *, api_name: str, ts_code: str, fields: str) -> Dict[str, Any]:
         payload = {
             "api_name": api_name,
