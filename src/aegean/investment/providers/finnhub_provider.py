@@ -14,6 +14,7 @@ class FinnhubProvider(ExternalDataProvider):
     profile_url = "https://finnhub.io/api/v1/stock/profile2"
     basic_financials_url = "https://finnhub.io/api/v1/stock/metric"
     news_url = "https://finnhub.io/api/v1/company-news"
+    insider_url = "https://finnhub.io/api/v1/stock/insider-transactions"
 
     def __init__(self, api_key: str | None = None, timeout_seconds: float = 4.0):
         super().__init__(api_key=api_key or self._env("FINNHUB_API_KEY"), timeout_seconds=timeout_seconds)
@@ -93,4 +94,64 @@ class FinnhubProvider(ExternalDataProvider):
             return self._timeout_result(symbol, market, asset_type)
         except Exception as exc:
             return self._error_result(symbol, market, asset_type, str(exc))
+
+    async def fetch_insider_transactions(
+        self,
+        symbol: str,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Fetch recent insider transactions for ``symbol``.
+
+        Returns a dict shaped as::
+
+            {"status": "ok|unavailable|timeout|rate_limited|error",
+             "data": [<raw finnhub rows>],
+             "signals": [...]}
+
+        The caller is responsible for turning ``data`` into
+        :class:`InsiderTrade` objects via
+        :func:`aegean.investment.sentiment.finnhub_insider_to_trades`.
+        """
+        if not self.api_key:
+            return {
+                "status": "unavailable",
+                "data": [],
+                "signals": ["FINNHUB_INSIDER_UNAVAILABLE"],
+                "message": "Missing FINNHUB_API_KEY",
+            }
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        params = {"symbol": symbol, "limit": int(limit), "token": self.api_key}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.insider_url, params=params) as resp:
+                    if resp.status == 429:
+                        return {
+                            "status": "rate_limited",
+                            "data": [],
+                            "signals": ["FINNHUB_INSIDER_RATE_LIMITED"],
+                            "message": "Provider rate limited",
+                        }
+                    payload = await resp.json()
+            rows = payload.get("data") if isinstance(payload, dict) else []
+            return {
+                "status": "ok",
+                "data": rows or [],
+                "signals": [],
+                "message": "",
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "timeout",
+                "data": [],
+                "signals": ["FINNHUB_INSIDER_TIMEOUT"],
+                "message": f"Timed out after {self.timeout_seconds}s",
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "data": [],
+                "signals": ["FINNHUB_INSIDER_FAILED"],
+                "message": str(exc),
+            }
 

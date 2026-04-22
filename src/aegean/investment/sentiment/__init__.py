@@ -1,5 +1,9 @@
 """Three-tier sentiment pipeline (insider trades + company news)."""
 
+from aegean.investment.sentiment.adapters import (
+    finnhub_insider_to_trades,
+    news_items_to_articles,
+)
 from aegean.investment.sentiment.pipeline import (
     InsiderTrade,
     NewsArticle,
@@ -18,4 +22,6 @@ __all__ = [
     "SentimentTier",
     "classify_insider_trade",
     "classify_news_article",
+    "finnhub_insider_to_trades",
+    "news_items_to_articles",
 ]
