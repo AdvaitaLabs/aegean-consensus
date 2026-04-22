@@ -49,10 +49,19 @@ from aegean.investment.debate import (
     parse_confidence,
     parse_target_exposure_pct,
 )
+from aegean.investment.masters import (
+    available_personas as _master_available_personas,
+    build_master_prompt,
+)
 from aegean.investment.memory import RoleMemoryRegistry
 from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, SerpAPIProvider, TavilyProvider, TushareProvider, YFinanceProvider
 from aegean.investment.providers.gateway import InvestmentDataGateway
 from aegean.investment.risk import PortfolioRiskEngine, PortfolioRiskResult
+from aegean.investment.sentiment import (
+    SentimentPipeline,
+    finnhub_insider_to_trades,
+    news_items_to_articles,
+)
 
 
 _SIGNAL_MAP = {
@@ -140,6 +149,7 @@ _TITLE_BY_ROLE = {
 
 _DEBATE_STANCES = ("bull", "bear")
 _RISK_DEBATE_STANCES = ("aggressive", "neutral", "conservative")
+_DEFAULT_MASTER_PERSONAS = ("buffett", "burry", "wood")
 
 _V3_ALLOWED_ASSET_TYPES = {
     AssetType.EQUITY,
@@ -451,6 +461,7 @@ class InvestmentAnalysisService:
         group_service: Optional[GroupChatService] = None,
         role_memory: Optional[RoleMemoryRegistry] = None,
         portfolio_risk_engine: Optional[PortfolioRiskEngine] = None,
+        sentiment_pipeline: Optional[SentimentPipeline] = None,
     ):
         self.agent_registry = agent_registry
         self.memory_system = memory_system
@@ -459,6 +470,7 @@ class InvestmentAnalysisService:
         self.group_service = group_service
         self.role_memory = role_memory or RoleMemoryRegistry()
         self.portfolio_risk_engine = portfolio_risk_engine or PortfolioRiskEngine()
+        self.sentiment_pipeline = sentiment_pipeline or SentimentPipeline()
         self.market_data_provider = YFinanceProvider()
         self.cn_market_data_provider = TushareProvider()
         self.crypto_market_data_provider = CoinGeckoProvider()
@@ -1002,6 +1014,12 @@ class InvestmentAnalysisService:
         provider_signals = self._collect_provider_signals(provider_status)
 
         role_memory_block = self._format_role_memory_for_prompt(role_memory_hits)
+        document_block = self._format_document_context_for_prompt(
+            request.metadata.get("document_chunks") if request.metadata else None
+        )
+        sentiment_block = self._format_sentiment_for_prompt(
+            normalized_market_data.get("sentiment") if isinstance(normalized_market_data, dict) else None
+        )
 
         return (
             f"You are {role_title}. Agent ID: {agent_id or 'shared_agent'}. Analyze {request.asset.symbol} "
@@ -1015,9 +1033,69 @@ class InvestmentAnalysisService:
             f"Provider status summary:\n{self._format_provider_status_for_prompt(provider_status)}\n"
             f"Provider signals: {', '.join(provider_signals) if provider_signals else 'none'}\n"
             f"Normalized external data:\n{normalized_context}"
+            f"{sentiment_block}"
+            f"{document_block}"
             f"{group_context}"
             f"{role_memory_block}\n"
             "Prioritize the data most relevant to your role. If key provider data is unavailable or degraded, explicitly mention the data gap and lower confidence accordingly. Output concise recommendation with one of BUY/HOLD/SELL/WATCH and key reasons."
+        )
+
+    @staticmethod
+    def _format_document_context_for_prompt(
+        chunks: Optional[List[Dict[str, Any]]],
+        max_chunks: int = 6,
+        max_chars_per_chunk: int = 600,
+    ) -> str:
+        """Render pre-ingested document chunks (10-K, PDFs, memos) into prompt text.
+
+        ``chunks`` is the caller-provided list under
+        ``request.metadata['document_chunks']`` — each dict should have
+        at least ``text`` and optionally ``section`` / ``source``.
+        """
+        if not chunks:
+            return ""
+        lines: List[str] = []
+        for idx, chunk in enumerate(chunks[:max_chunks], start=1):
+            if not isinstance(chunk, dict):
+                continue
+            text = str(chunk.get("text") or "").strip().replace("\r", "")
+            if not text:
+                continue
+            if len(text) > max_chars_per_chunk:
+                text = text[:max_chars_per_chunk].rstrip() + "..."
+            section = str(chunk.get("section") or "").strip()
+            source = str(chunk.get("source") or "").strip()
+            header_bits = [f"#{idx}"]
+            if section:
+                header_bits.append(f"section={section}")
+            if source:
+                header_bits.append(f"source={source}")
+            lines.append(f"[{' '.join(header_bits)}]\n{text}")
+        if not lines:
+            return ""
+        return (
+            "\n\nIngested document excerpts (10-K / filings / uploaded memos):\n"
+            + "\n\n".join(lines)
+        )
+
+    @staticmethod
+    def _format_sentiment_for_prompt(sentiment: Optional[Dict[str, Any]]) -> str:
+        if not sentiment:
+            return ""
+        insider = sentiment.get("insider_trading", {}) or {}
+        news = sentiment.get("news_sentiment", {}) or {}
+        insider_metrics = insider.get("metrics", {}) or {}
+        news_metrics = news.get("metrics", {}) or {}
+        return (
+            "\n\nSentiment (insider weight=0.3, news weight=0.7):\n"
+            f"- overall: {sentiment.get('signal', 'neutral')} "
+            f"(confidence={sentiment.get('confidence', 0.0)})\n"
+            f"- insider: {insider.get('signal', 'neutral')}, "
+            f"bullish={insider_metrics.get('bullish', 0)}, bearish={insider_metrics.get('bearish', 0)}, "
+            f"total={insider_metrics.get('total', 0)}\n"
+            f"- news: {news.get('signal', 'neutral')}, "
+            f"bullish={news_metrics.get('bullish', 0)}, bearish={news_metrics.get('bearish', 0)}, "
+            f"total={news_metrics.get('total', 0)}"
         )
 
     @staticmethod
@@ -1058,11 +1136,65 @@ class InvestmentAnalysisService:
         self,
         request: InvestmentAnalysisRequest,
     ) -> Dict[str, Any]:
-        return await self.data_gateway.fetch_all(
+        normalized = await self.data_gateway.fetch_all(
             request.asset.symbol,
             request.asset.market.value,
             request.asset.asset_type.value,
         )
+        await self._augment_with_sentiment(request, normalized)
+        return normalized
+
+    async def _augment_with_sentiment(
+        self,
+        request: InvestmentAnalysisRequest,
+        normalized: Dict[str, Any],
+    ) -> None:
+        """Run the three-tier sentiment pipeline and attach results.
+
+        Writes into ``normalized['sentiment']`` and pushes a synthetic
+        provider-status entry under key ``sentiment`` so the existing
+        provider-status / provider-signals flow picks it up automatically.
+        Any failure is swallowed — sentiment is additive.
+        """
+        try:
+            news_items = normalized.get("news") or []
+            articles = news_items_to_articles(news_items)
+            insider_trades = []
+            insider_status: Dict[str, Any] = {"status": "skipped", "signals": []}
+            if request.asset.market == MarketCode.US and isinstance(
+                self.news_data_provider, FinnhubProvider
+            ):
+                insider_payload = await self.news_data_provider.fetch_insider_transactions(
+                    request.asset.symbol
+                )
+                insider_status = {
+                    "status": insider_payload.get("status", "unknown"),
+                    "signals": list(insider_payload.get("signals") or []),
+                    "message": insider_payload.get("message", ""),
+                }
+                insider_trades = finnhub_insider_to_trades(insider_payload.get("data") or [])
+            if not articles and not insider_trades:
+                return
+            result = self.sentiment_pipeline.assess(insider_trades, articles)
+            normalized["sentiment"] = result.to_dict()
+            signal_token = f"SENTIMENT_{result.signal.upper()}"
+            provider_status = normalized.setdefault("provider_status", {})
+            provider_status["sentiment"] = {
+                "status": "ok",
+                "signals": [signal_token],
+                "message": (
+                    f"sentiment={result.signal} conf={result.confidence:.2f} "
+                    f"insider={result.insider.total} news={result.news.total}"
+                ),
+                "insider_status": insider_status,
+            }
+            signals = list(normalized.get("provider_signals") or [])
+            if signal_token not in signals:
+                signals.append(signal_token)
+            normalized["provider_signals"] = signals
+        except Exception:
+            # Never let sentiment break the main pipeline.
+            return
 
     @staticmethod
     def _format_provider_status_for_prompt(provider_status: Dict[str, Any]) -> str:
@@ -1541,6 +1673,93 @@ class InvestmentAnalysisService:
             ),
         )
 
+    async def _run_masters_panel(
+        self,
+        request: InvestmentAnalysisRequest,
+        context: DebateContext,
+        bull_history: List[str],
+        bear_history: List[str],
+        rounds: List[DiscussionRound],
+        emit: Callable[..., Awaitable[None]],
+        start_round_index: int,
+    ) -> List[str]:
+        """Optionally run a master-investor consultation inside a debate.
+
+        Triggered only when ``request.metadata['panel_type'] == 'masters'``.
+        Each persona in ``metadata['master_personas']`` (falling back to
+        ``_DEFAULT_MASTER_PERSONAS``) runs one turn against the debate
+        context and the Bull/Bear transcripts so far. Outputs are
+        appended as a single ``stage='masters_panel'`` discussion round.
+        Returns short summaries suitable for injection into downstream
+        stages' analyst_summaries.
+        """
+        if not request.metadata or request.metadata.get("panel_type") != "masters":
+            return []
+
+        requested = request.metadata.get("master_personas") or list(_DEFAULT_MASTER_PERSONAS)
+        known = set(_master_available_personas())
+        personas = [k for k in requested if k in known]
+        if not personas:
+            return []
+
+        chair_agent = self._select_debate_agent("chair")
+        # Reuse chair agent as a generic LLM surface; fall back to bull if absent.
+        runner = chair_agent or self._select_debate_agent("bull_researcher")
+        if runner is None:
+            return []
+
+        recent_analysts = list(context.analyst_summaries)
+        if bull_history:
+            recent_analysts.append(f"bull_last: {bull_history[-1][:300]}")
+        if bear_history:
+            recent_analysts.append(f"bear_last: {bear_history[-1][:300]}")
+
+        entries: List[DiscussionAgentEntry] = []
+        summaries: List[str] = []
+        for persona_key in personas:
+            prompt = build_master_prompt(
+                key=persona_key,
+                symbol=request.asset.symbol,
+                market=request.asset.market.value,
+                asset_type=request.asset.asset_type.value,
+                horizon=request.timeframe.horizon,
+                analyst_summaries=recent_analysts,
+                provider_signals=context.provider_signals,
+                group_context=context.group_context,
+            )
+            solution = await self._run_agent_turn(runner, prompt)
+            signal = self._extract_signal(solution.answer)
+            summary = self._summary_from_answer(solution.answer)
+            entries.append(
+                DiscussionAgentEntry(
+                    agent_id=runner.agent_id,
+                    role=f"master_{persona_key}",
+                    stance="master",
+                    current_signal=signal,
+                    summary=summary,
+                    message=solution.answer,
+                )
+            )
+            summaries.append(f"master/{persona_key} [{signal}]: {summary}")
+
+        if not entries:
+            return []
+
+        masters_round_number = start_round_index + 1
+        rounds.append(
+            DiscussionRound(
+                round_number=masters_round_number,
+                stage="masters_panel",
+                agents=entries,
+            )
+        )
+        await emit(
+            "debate_round_finished",
+            round_number=masters_round_number,
+            stage="masters_panel",
+        )
+        return summaries
+
     async def _run_debate(
         self,
         request: InvestmentAnalysisRequest,
@@ -1636,6 +1855,15 @@ class InvestmentAnalysisService:
                 stage="investment_debate",
             )
 
+        # Phase 1.5: Optional master-investor consultation (panel_type="masters")
+        master_summaries = await self._run_masters_panel(
+            request, context, bull_history, bear_history, rounds, emit,
+            start_round_index=bull_rounds,
+        )
+        if master_summaries:
+            # Feed master views into the context so Research Manager / Chair see them.
+            context.analyst_summaries = list(context.analyst_summaries) + master_summaries
+
         # Phase 2: Research Manager synthesis
         rm_prompt = build_research_manager_prompt(context, bull_history, bear_history)
         rm_solution = await self._run_agent_turn(rm_agent, rm_prompt)
@@ -1643,9 +1871,10 @@ class InvestmentAnalysisService:
         plan_action_signal = self._extract_signal(plan_text)
         plan_exposure = parse_target_exposure_pct(plan_text)
         plan_confidence = parse_confidence(plan_text)
+        rm_round_number = len(rounds) + 1
         rounds.append(
             DiscussionRound(
-                round_number=bull_rounds + 1,
+                round_number=rm_round_number,
                 stage="research_manager",
                 candidate_action=(_ACTION_BY_SIGNAL.get(plan_action_signal, current_recommendation.action)).value,
                 candidate_confidence=plan_confidence if plan_confidence is not None else current_recommendation.confidence,
@@ -1661,11 +1890,11 @@ class InvestmentAnalysisService:
                 ],
             )
         )
-        await emit("debate_round_finished", round_number=bull_rounds + 1, stage="research_manager")
+        await emit("debate_round_finished", round_number=rm_round_number, stage="research_manager")
 
         # Phase 3: Risk debate (Aggressive / Neutral / Conservative)
         peer_statements: Dict[str, str] = {}
-        risk_round_index = bull_rounds + 1
+        risk_round_index = rm_round_number
         for risk_round in range(1, risk_rounds + 1):
             risk_round_index += 1
             round_entries: List[DiscussionAgentEntry] = []
