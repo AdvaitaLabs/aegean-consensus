@@ -43,6 +43,7 @@ from aegean.services.group_chat_service import GroupChatService
 from aegean.investment.memory import RoleMemoryRegistry
 from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, SerpAPIProvider, TavilyProvider, TushareProvider, YFinanceProvider
 from aegean.investment.providers.gateway import InvestmentDataGateway
+from aegean.investment.risk import PortfolioRiskEngine, PortfolioRiskResult
 
 
 _SIGNAL_MAP = {
@@ -430,6 +431,7 @@ class InvestmentAnalysisService:
         risk_coordinator: Optional[RiskConsensusCoordinator] = None,
         group_service: Optional[GroupChatService] = None,
         role_memory: Optional[RoleMemoryRegistry] = None,
+        portfolio_risk_engine: Optional[PortfolioRiskEngine] = None,
     ):
         self.agent_registry = agent_registry
         self.memory_system = memory_system
@@ -437,6 +439,7 @@ class InvestmentAnalysisService:
         self.risk_coordinator = risk_coordinator
         self.group_service = group_service
         self.role_memory = role_memory or RoleMemoryRegistry()
+        self.portfolio_risk_engine = portfolio_risk_engine or PortfolioRiskEngine()
         self.market_data_provider = YFinanceProvider()
         self.cn_market_data_provider = TushareProvider()
         self.crypto_market_data_provider = CoinGeckoProvider()
@@ -600,6 +603,14 @@ class InvestmentAnalysisService:
             )
 
         recommendation, constraints_summary = self._apply_constraints(request, recommendation)
+        recommendation, constraints_summary, portfolio_risk_payload = self._apply_portfolio_risk(
+            request,
+            normalized_market_data,
+            recommendation,
+            constraints_summary,
+        )
+        if portfolio_risk_payload:
+            await emit("portfolio_risk_applied", **portfolio_risk_payload)
         policy_overrides = self._build_policy_overrides(constraints_summary)
         await emit(
             "constraints_applied",
@@ -1271,6 +1282,175 @@ class InvestmentAnalysisService:
             ),
             summary,
         )
+
+    def _apply_portfolio_risk(
+        self,
+        request: InvestmentAnalysisRequest,
+        normalized_market_data: Dict[str, Any],
+        recommendation: InvestmentRecommendation,
+        constraints_summary: Dict[str, Any],
+    ) -> Tuple[InvestmentRecommendation, Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Cap target exposure by volatility- and correlation-adjusted limits.
+
+        Runs only when historical price series are available. If the data is
+        missing the recommendation is returned unchanged and the summary gains
+        a ``portfolio_risk_adjustment.skipped`` note.
+        """
+        target_history = self._extract_price_history(
+            normalized_market_data, request.asset.symbol
+        )
+        updated_summary = dict(constraints_summary or {})
+
+        if not target_history or len(target_history) < 5:
+            updated_summary["portfolio_risk_adjustment"] = {
+                "applied": False,
+                "reason": "insufficient_price_history",
+            }
+            return recommendation, updated_summary, None
+
+        price_series = {request.asset.symbol: list(target_history)}
+        portfolio_ctx = dict(request.portfolio_context or {})
+        history_map = portfolio_ctx.get("price_history_by_symbol") or {}
+        if isinstance(history_map, dict):
+            for sym, series in history_map.items():
+                if sym == request.asset.symbol or not series:
+                    continue
+                cleaned = [float(p) for p in series if isinstance(p, (int, float)) and p > 0]
+                if len(cleaned) >= 5:
+                    price_series[sym] = cleaned
+
+        try:
+            assessment = self.portfolio_risk_engine.assess(
+                target_symbol=request.asset.symbol,
+                price_series_by_symbol=price_series,
+                portfolio=portfolio_ctx,
+            )
+        except Exception as exc:
+            updated_summary["portfolio_risk_adjustment"] = {
+                "applied": False,
+                "reason": f"engine_error: {exc}",
+            }
+            return recommendation, updated_summary, None
+
+        new_recommendation, risk_summary = self._cap_recommendation_by_risk(
+            recommendation, assessment
+        )
+
+        caps = dict(updated_summary.get("effective_caps") or {})
+        caps["portfolio_risk_pct"] = round(assessment.combined_limit_pct, 6)
+        updated_summary["effective_caps"] = caps
+        triggered = list(updated_summary.get("triggered_rules") or [])
+        if risk_summary["binding"]:
+            triggered.append("portfolio_risk_cap")
+        updated_summary["triggered_rules"] = triggered
+        updated_summary["portfolio_risk_adjustment"] = {
+            "applied": True,
+            "binding": risk_summary["binding"],
+            "position_before_pct": risk_summary["position_before_pct"],
+            "position_after_pct": risk_summary["position_after_pct"],
+            "engine_result": assessment.to_dict(),
+        }
+
+        payload = {
+            "symbol": request.asset.symbol,
+            "combined_limit_pct": round(assessment.combined_limit_pct, 6),
+            "base_limit_pct": round(assessment.base_limit_pct, 6),
+            "correlation_multiplier": round(assessment.correlation_multiplier, 4),
+            "annualized_volatility": round(assessment.volatility.annualized_volatility, 6),
+            "binding": risk_summary["binding"],
+            "position_before_pct": risk_summary["position_before_pct"],
+            "position_after_pct": risk_summary["position_after_pct"],
+            "reasoning": assessment.reasoning,
+        }
+        return new_recommendation, updated_summary, payload
+
+    @staticmethod
+    def _cap_recommendation_by_risk(
+        recommendation: InvestmentRecommendation,
+        assessment: PortfolioRiskResult,
+    ) -> Tuple[InvestmentRecommendation, Dict[str, Any]]:
+        position = dict(recommendation.position_suggestion or {})
+        before = float(position.get("target_exposure_pct", 0.0) or 0.0)
+        cap = float(assessment.combined_limit_pct)
+        binding = False
+        after = before
+        if before > cap:
+            after = cap
+            position["target_exposure_pct"] = cap
+            binding = True
+        next_action = recommendation.action
+        if cap <= 0.0 and next_action == RecommendationAction.BUY:
+            next_action = RecommendationAction.HOLD
+            binding = True
+        return (
+            InvestmentRecommendation(
+                action=next_action,
+                confidence=recommendation.confidence,
+                position_suggestion=position,
+                decision_rationale=recommendation.decision_rationale,
+            ),
+            {
+                "binding": binding,
+                "position_before_pct": round(before, 6),
+                "position_after_pct": round(after, 6),
+            },
+        )
+
+    @staticmethod
+    def _extract_price_history(
+        normalized_market_data: Dict[str, Any],
+        symbol: str,
+    ) -> List[float]:
+        """Pull a price series for ``symbol`` from gateway output.
+
+        Looks in several well-known locations so providers can populate the
+        field without coordinating on a single schema upfront.
+        """
+        candidates: List[Any] = []
+        market = normalized_market_data.get("market") or {}
+        if isinstance(market, dict):
+            for key in ("price_history", "close_history", "history"):
+                if market.get(key):
+                    candidates.append(market[key])
+        for key in ("price_history", "market_history", "history"):
+            if normalized_market_data.get(key):
+                candidates.append(normalized_market_data[key])
+        for candidate in candidates:
+            series = InvestmentAnalysisService._coerce_price_series(candidate, symbol)
+            if series:
+                return series
+        return []
+
+    @staticmethod
+    def _coerce_price_series(candidate: Any, symbol: str) -> List[float]:
+        """Best-effort conversion of gateway history payloads into List[float]."""
+        if candidate is None:
+            return []
+        if isinstance(candidate, dict):
+            # Either {symbol: [prices]} or {date: price}
+            if symbol in candidate and isinstance(candidate[symbol], (list, tuple)):
+                return InvestmentAnalysisService._coerce_price_series(candidate[symbol], symbol)
+            values = list(candidate.values())
+            if all(isinstance(v, (int, float)) for v in values):
+                return [float(v) for v in values if v is not None and v > 0]
+            if values and isinstance(values[0], (list, tuple)):
+                return InvestmentAnalysisService._coerce_price_series(values[0], symbol)
+        if isinstance(candidate, (list, tuple)):
+            result: List[float] = []
+            for item in candidate:
+                if isinstance(item, (int, float)):
+                    if item > 0:
+                        result.append(float(item))
+                elif isinstance(item, dict):
+                    price = (
+                        item.get("close")
+                        or item.get("adj_close")
+                        or item.get("price")
+                    )
+                    if isinstance(price, (int, float)) and price > 0:
+                        result.append(float(price))
+            return result
+        return []
 
     async def _run_roundtable(
         self,
