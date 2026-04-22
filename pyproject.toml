@@ -33,6 +33,7 @@ dependencies = [
     "structlog>=23.2.0",
     "python-dotenv>=1.0.0",
     "yfinance>=0.2.40",
+    "rank-bm25>=0.2.2",
 ]
 
 [project.optional-dependencies]

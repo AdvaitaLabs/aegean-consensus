@@ -40,6 +40,7 @@ from aegean.investment.models import (
 from aegean.risk.models import RiskContext, RiskRequest, RiskSubject
 from aegean.risk.risk_consensus import RiskConsensusCoordinator
 from aegean.services.group_chat_service import GroupChatService
+from aegean.investment.memory import RoleMemoryRegistry
 from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, SerpAPIProvider, TavilyProvider, TushareProvider, YFinanceProvider
 from aegean.investment.providers.gateway import InvestmentDataGateway
 
@@ -428,12 +429,14 @@ class InvestmentAnalysisService:
         llm_client: Optional[Any] = None,
         risk_coordinator: Optional[RiskConsensusCoordinator] = None,
         group_service: Optional[GroupChatService] = None,
+        role_memory: Optional[RoleMemoryRegistry] = None,
     ):
         self.agent_registry = agent_registry
         self.memory_system = memory_system
         self.llm_client = llm_client
         self.risk_coordinator = risk_coordinator
         self.group_service = group_service
+        self.role_memory = role_memory or RoleMemoryRegistry()
         self.market_data_provider = YFinanceProvider()
         self.cn_market_data_provider = TushareProvider()
         self.crypto_market_data_provider = CoinGeckoProvider()
@@ -770,10 +773,17 @@ class InvestmentAnalysisService:
                 return agent, exc
 
         panel_roles = self._panel_roles_for_task(task_type)
+        group_id = group_injection.group_id if group_injection else None
+        situation_text = self._build_situation_text(request, normalized_market_data)
+        agent_context: Dict[str, Dict[str, str]] = {}
         tasks = []
         for index, agent in enumerate(agents):
             agent_role = panel_roles[index] if index < len(panel_roles) else self._role_for_task_type(task_type)
             role_skills = self._skills_for_role(agent_role, selected_skills)
+            recalled = self.role_memory.recall(
+                agent_role, situation_text, group_id=group_id, n_matches=2
+            )
+            agent_context[agent.agent_id] = {"role": agent_role}
             tasks.append(
                 asyncio.create_task(
                     _run(
@@ -786,6 +796,7 @@ class InvestmentAnalysisService:
                             group_injection,
                             agent_role=agent_role,
                             agent_id=agent.agent_id,
+                            role_memory_hits=recalled,
                         ),
                     )
                 )
@@ -818,6 +829,16 @@ class InvestmentAnalysisService:
                 solution = result
             solutions.append(solution)
             signal = self._extract_signal(solution.answer)
+            agent_role = agent_context.get(agent.agent_id, {}).get("role") or self._role_for_task_type(task_type)
+            if not isinstance(result, Exception):
+                self._record_role_experience(
+                    role=agent_role,
+                    situation=situation_text,
+                    solution=solution,
+                    group_id=group_id,
+                    request=request,
+                    signal=signal,
+                )
             await emit(
                 "agent_completed",
                 agent_id=solution.agent_id,
@@ -828,6 +849,72 @@ class InvestmentAnalysisService:
 
         return solutions
 
+    def _build_situation_text(
+        self,
+        request: InvestmentAnalysisRequest,
+        normalized_market_data: Dict[str, Any],
+    ) -> str:
+        parts: List[str] = [
+            f"symbol={request.asset.symbol}",
+            f"market={request.asset.market.value}",
+            f"asset_type={request.asset.asset_type.value}",
+            f"horizon={request.timeframe.horizon}",
+            f"risk_profile={request.risk_profile}",
+            f"objective={request.objective}",
+        ]
+        if request.market_snapshot:
+            parts.append(f"snapshot={request.market_snapshot}")
+        market = normalized_market_data.get("market") or {}
+        for key in ("price", "change_pct", "pe_ratio", "pb_ratio", "market_cap", "week52_high", "week52_low"):
+            if key in market and market[key] is not None:
+                parts.append(f"{key}={market[key]}")
+        fundamentals = normalized_market_data.get("fundamentals") or {}
+        for key in ("revenue_growth", "net_margin", "roe", "debt_to_equity"):
+            if key in fundamentals and fundamentals[key] is not None:
+                parts.append(f"{key}={fundamentals[key]}")
+        news = normalized_market_data.get("news") or []
+        polarities = [
+            item.get("polarity") for item in news[:5]
+            if isinstance(item, dict) and item.get("polarity")
+        ]
+        if polarities:
+            parts.append("news_polarity=" + ",".join(polarities))
+        return " ".join(str(p) for p in parts)
+
+    def _record_role_experience(
+        self,
+        role: str,
+        situation: str,
+        solution: Solution,
+        group_id: Optional[str],
+        request: InvestmentAnalysisRequest,
+        signal: str,
+    ) -> None:
+        answer = (solution.answer or "").strip()
+        if not answer:
+            return
+        metadata = {
+            "agent_id": solution.agent_id,
+            "confidence": solution.confidence,
+            "signal": signal,
+            "symbol": request.asset.symbol,
+            "market": request.asset.market.value,
+            "asset_type": request.asset.asset_type.value,
+            "horizon": request.timeframe.horizon,
+        }
+        try:
+            self.role_memory.record(
+                role=role,
+                situation=situation,
+                recommendation=answer,
+                group_id=group_id,
+                metadata=metadata,
+                created_at=_utc_now().isoformat(),
+            )
+        except Exception:
+            # Memory recording should never break analysis.
+            pass
+
     def _build_task_prompt(
         self,
         request: InvestmentAnalysisRequest,
@@ -837,6 +924,7 @@ class InvestmentAnalysisService:
         group_injection: Optional[GroupKnowledgeInjection] = None,
         agent_role: Optional[str] = None,
         agent_id: Optional[str] = None,
+        role_memory_hits: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         facts = "\n".join(f"- {f}" for f in request.public_facts[:10])
         facts = facts or "- No extra public facts provided"
@@ -867,6 +955,8 @@ class InvestmentAnalysisService:
         provider_status = normalized_market_data.get("provider_status") or {}
         provider_signals = self._collect_provider_signals(provider_status)
 
+        role_memory_block = self._format_role_memory_for_prompt(role_memory_hits)
+
         return (
             f"You are {role_title}. Agent ID: {agent_id or 'shared_agent'}. Analyze {request.asset.symbol} "
             f"({request.asset.market.value}, {request.asset.asset_type.value}) with horizon {request.timeframe.horizon}.\n"
@@ -879,8 +969,43 @@ class InvestmentAnalysisService:
             f"Provider status summary:\n{self._format_provider_status_for_prompt(provider_status)}\n"
             f"Provider signals: {', '.join(provider_signals) if provider_signals else 'none'}\n"
             f"Normalized external data:\n{normalized_context}"
-            f"{group_context}\n"
+            f"{group_context}"
+            f"{role_memory_block}\n"
             "Prioritize the data most relevant to your role. If key provider data is unavailable or degraded, explicitly mention the data gap and lower confidence accordingly. Output concise recommendation with one of BUY/HOLD/SELL/WATCH and key reasons."
+        )
+
+    @staticmethod
+    def _format_role_memory_for_prompt(
+        hits: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        if not hits:
+            return ""
+        lines: List[str] = []
+        for idx, hit in enumerate(hits, start=1):
+            rec = (hit.get("recommendation") or "").strip().replace("\n", " ")
+            if len(rec) > 400:
+                rec = rec[:400].rstrip() + "..."
+            score = hit.get("similarity_score") or 0.0
+            outcome = hit.get("outcome") or {}
+            outcome_note = ""
+            if outcome:
+                action = outcome.get("action") or outcome.get("actual_signal")
+                hit_flag = outcome.get("hit")
+                return_pct = outcome.get("return_pct")
+                parts: List[str] = []
+                if action:
+                    parts.append(f"actual={action}")
+                if hit_flag is not None:
+                    parts.append(f"hit={hit_flag}")
+                if return_pct is not None:
+                    parts.append(f"return_pct={return_pct}")
+                if parts:
+                    outcome_note = f" [outcome: {', '.join(parts)}]"
+            lines.append(f"- case #{idx} (sim={score:.2f}){outcome_note}: {rec}")
+        return (
+            "\n\nPast role experiences (same role, similar situations). "
+            "Treat as precedent, not as ground truth — cite only if the current setup truly matches:\n"
+            + "\n".join(lines)
         )
 
     async def _fetch_normalized_asset_data(
