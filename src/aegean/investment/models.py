@@ -14,6 +14,7 @@ class InvestmentMode(str, Enum):
     AUTO = "auto"
     COLLABORATE = "collaborate"
     ROUNDTABLE = "roundtable"
+    DEBATE = "debate"
 
 
 class MarketCode(str, Enum):

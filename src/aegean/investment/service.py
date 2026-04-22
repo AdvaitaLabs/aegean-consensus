@@ -40,6 +40,15 @@ from aegean.investment.models import (
 from aegean.risk.models import RiskContext, RiskRequest, RiskSubject
 from aegean.risk.risk_consensus import RiskConsensusCoordinator
 from aegean.services.group_chat_service import GroupChatService
+from aegean.investment.debate import (
+    DebateContext,
+    build_chair_prompt,
+    build_research_manager_prompt,
+    build_researcher_prompt,
+    build_risk_debate_prompt,
+    parse_confidence,
+    parse_target_exposure_pct,
+)
 from aegean.investment.memory import RoleMemoryRegistry
 from aegean.investment.providers import CoinGeckoProvider, ExaProvider, FMPProvider, FinnhubProvider, SerpAPIProvider, TavilyProvider, TushareProvider, YFinanceProvider
 from aegean.investment.providers.gateway import InvestmentDataGateway
@@ -120,7 +129,17 @@ _TITLE_BY_ROLE = {
     "options_specialist": "Options Analysis Agent",
     "crypto_specialist": "Crypto Analysis Agent",
     "risk_specialist": "Risk Review Agent",
+    "bull_researcher": "Bull Researcher",
+    "bear_researcher": "Bear Researcher",
+    "research_manager": "Research Manager",
+    "risk_aggressive": "Aggressive Risk Analyst",
+    "risk_neutral": "Neutral Risk Analyst",
+    "risk_conservative": "Conservative Risk Analyst",
+    "chair": "Chair / Portfolio Manager",
 }
+
+_DEBATE_STANCES = ("bull", "bear")
+_RISK_DEBATE_STANCES = ("aggressive", "neutral", "conservative")
 
 _V3_ALLOWED_ASSET_TYPES = {
     AssetType.EQUITY,
@@ -598,6 +617,22 @@ class InvestmentAnalysisService:
             )
             await emit(
                 "roundtable_finished",
+                rounds_used=consensus_view.rounds_used,
+                consensus_reached=consensus_view.consensus_reached,
+            )
+        elif request.mode == InvestmentMode.DEBATE and agents:
+            await emit("debate_started")
+            consensus_view, recommendation, consensus_trace = await self._run_debate(
+                request,
+                task_type,
+                agent_outputs,
+                recommendation,
+                normalized_market_data,
+                group_injection,
+                emit,
+            )
+            await emit(
+                "debate_finished",
                 rounds_used=consensus_view.rounds_used,
                 consensus_reached=consensus_view.consensus_reached,
             )
@@ -1451,6 +1486,279 @@ class InvestmentAnalysisService:
                         result.append(float(price))
             return result
         return []
+
+    def _select_debate_agent(self, role: str) -> Optional[Agent]:
+        """Pick the best-weighted agent for a debate role.
+
+        Falls back to any available agent if none is registered with weight
+        for this specific debate role.
+        """
+        all_agents = self.agent_registry.get_all_agents()
+        if not all_agents:
+            return None
+        ranked = sorted(all_agents, key=lambda a: a.get_weight_for_task(role), reverse=True)
+        return ranked[0]
+
+    async def _run_agent_turn(self, agent: Agent, prompt: str) -> Solution:
+        try:
+            return await agent.generate_solution(prompt)
+        except Exception as exc:
+            return Solution(agent_id=agent.agent_id, answer=f"Agent failed: {exc}", confidence=0.2)
+
+    @staticmethod
+    def _build_debate_context(
+        request: InvestmentAnalysisRequest,
+        agent_outputs: List[AgentOutput],
+        provider_signals: List[str],
+        group_injection: Optional[GroupKnowledgeInjection],
+        current_recommendation: InvestmentRecommendation,
+        portfolio_risk_reasoning: str = "",
+    ) -> DebateContext:
+        summaries: List[str] = []
+        signals: Dict[str, str] = {}
+        for out in agent_outputs:
+            signals[out.role or out.agent_id] = out.signal
+            line = f"{out.role or out.agent_id} [{out.signal}, conf={out.confidence:.2f}]: {out.summary}"
+            summaries.append(line)
+        group_context_str = ""
+        if group_injection and group_injection.memory_context:
+            group_context_str = f"\nGroup memory context:\n{group_injection.memory_context}\n"
+        return DebateContext(
+            symbol=request.asset.symbol,
+            market=request.asset.market.value,
+            asset_type=request.asset.asset_type.value,
+            horizon=request.timeframe.horizon,
+            risk_profile=request.risk_profile,
+            objective=request.objective,
+            analyst_summaries=summaries,
+            analyst_signals=signals,
+            provider_signals=provider_signals,
+            group_context=group_context_str,
+            portfolio_risk_reasoning=portfolio_risk_reasoning,
+            candidate_action=current_recommendation.action.value,
+            candidate_target_exposure_pct=float(
+                current_recommendation.position_suggestion.get("target_exposure_pct", 0.0) or 0.0
+            ),
+        )
+
+    async def _run_debate(
+        self,
+        request: InvestmentAnalysisRequest,
+        task_type: str,
+        agent_outputs: List[AgentOutput],
+        current_recommendation: InvestmentRecommendation,
+        normalized_market_data: Dict[str, Any],
+        group_injection: Optional[GroupKnowledgeInjection],
+        emit: Callable[..., Awaitable[None]],
+        bull_rounds: int = 2,
+        risk_rounds: int = 1,
+    ) -> Tuple[ConsensusResultView, InvestmentRecommendation, ConsensusTrace]:
+        """Adversarial debate: Bull vs Bear -> Research Mgr -> Risk Debate -> Chair."""
+        provider_status = normalized_market_data.get("provider_status") or {}
+        provider_signals = self._collect_provider_signals(provider_status)
+        context = self._build_debate_context(
+            request,
+            agent_outputs,
+            provider_signals,
+            group_injection,
+            current_recommendation,
+        )
+
+        bull_agent = self._select_debate_agent("bull_researcher")
+        bear_agent = self._select_debate_agent("bear_researcher")
+        rm_agent = self._select_debate_agent("research_manager")
+        chair_agent = self._select_debate_agent("chair")
+        if not all([bull_agent, bear_agent, rm_agent, chair_agent]):
+            # Not enough agents to run debate; fall back to current recommendation.
+            return (
+                ConsensusResultView(
+                    enabled=True,
+                    rounds_used=0,
+                    consensus_reached=False,
+                    final_action=current_recommendation.action.value,
+                    weighted_votes=self._calculate_weighted_votes(agent_outputs),
+                ),
+                current_recommendation,
+                ConsensusTrace(
+                    discussion_enabled=True,
+                    final_summary="Debate skipped: insufficient agents registered.",
+                    rounds=[],
+                ),
+            )
+
+        bull_history: List[str] = []
+        bear_history: List[str] = []
+        rounds: List[DiscussionRound] = []
+
+        # Phase 1: Bull vs Bear alternating debate
+        for round_idx in range(1, bull_rounds + 1):
+            bull_prompt = build_researcher_prompt(
+                "bull", round_idx, context, bull_history, bear_history
+            )
+            bull_solution = await self._run_agent_turn(bull_agent, bull_prompt)
+            bull_history.append(bull_solution.answer)
+
+            bear_prompt = build_researcher_prompt(
+                "bear", round_idx, context, bear_history, bull_history
+            )
+            bear_solution = await self._run_agent_turn(bear_agent, bear_prompt)
+            bear_history.append(bear_solution.answer)
+
+            rounds.append(
+                DiscussionRound(
+                    round_number=round_idx,
+                    stage="investment_debate",
+                    candidate_action=current_recommendation.action.value,
+                    candidate_confidence=current_recommendation.confidence,
+                    agents=[
+                        DiscussionAgentEntry(
+                            agent_id=bull_agent.agent_id,
+                            role="bull_researcher",
+                            stance="bull",
+                            current_signal="bullish",
+                            summary=self._summary_from_answer(bull_solution.answer),
+                            message=bull_solution.answer,
+                        ),
+                        DiscussionAgentEntry(
+                            agent_id=bear_agent.agent_id,
+                            role="bear_researcher",
+                            stance="bear",
+                            current_signal="bearish",
+                            summary=self._summary_from_answer(bear_solution.answer),
+                            message=bear_solution.answer,
+                        ),
+                    ],
+                )
+            )
+            await emit(
+                "debate_round_finished",
+                round_number=round_idx,
+                stage="investment_debate",
+            )
+
+        # Phase 2: Research Manager synthesis
+        rm_prompt = build_research_manager_prompt(context, bull_history, bear_history)
+        rm_solution = await self._run_agent_turn(rm_agent, rm_prompt)
+        plan_text = rm_solution.answer
+        plan_action_signal = self._extract_signal(plan_text)
+        plan_exposure = parse_target_exposure_pct(plan_text)
+        plan_confidence = parse_confidence(plan_text)
+        rounds.append(
+            DiscussionRound(
+                round_number=bull_rounds + 1,
+                stage="research_manager",
+                candidate_action=(_ACTION_BY_SIGNAL.get(plan_action_signal, current_recommendation.action)).value,
+                candidate_confidence=plan_confidence if plan_confidence is not None else current_recommendation.confidence,
+                agents=[
+                    DiscussionAgentEntry(
+                        agent_id=rm_agent.agent_id,
+                        role="research_manager",
+                        stance="review",
+                        current_signal=plan_action_signal,
+                        summary=self._summary_from_answer(plan_text),
+                        message=plan_text,
+                    )
+                ],
+            )
+        )
+        await emit("debate_round_finished", round_number=bull_rounds + 1, stage="research_manager")
+
+        # Phase 3: Risk debate (Aggressive / Neutral / Conservative)
+        peer_statements: Dict[str, str] = {}
+        risk_round_index = bull_rounds + 1
+        for risk_round in range(1, risk_rounds + 1):
+            risk_round_index += 1
+            round_entries: List[DiscussionAgentEntry] = []
+            for stance in _RISK_DEBATE_STANCES:
+                role_name = f"risk_{stance}"
+                risk_agent = self._select_debate_agent(role_name)
+                if risk_agent is None:
+                    continue
+                prompt = build_risk_debate_prompt(stance, risk_round, context, plan_text, peer_statements)
+                sol = await self._run_agent_turn(risk_agent, prompt)
+                peer_statements[stance] = sol.answer
+                round_entries.append(
+                    DiscussionAgentEntry(
+                        agent_id=risk_agent.agent_id,
+                        role=role_name,
+                        stance=stance,
+                        current_signal=self._extract_signal(sol.answer),
+                        summary=self._summary_from_answer(sol.answer),
+                        message=sol.answer,
+                    )
+                )
+            rounds.append(
+                DiscussionRound(
+                    round_number=risk_round_index,
+                    stage="risk_debate",
+                    candidate_action=(_ACTION_BY_SIGNAL.get(plan_action_signal, current_recommendation.action)).value,
+                    candidate_confidence=plan_confidence if plan_confidence is not None else current_recommendation.confidence,
+                    agents=round_entries,
+                )
+            )
+            await emit(
+                "debate_round_finished",
+                round_number=risk_round_index,
+                stage="risk_debate",
+            )
+
+        # Phase 4: Chair / Portfolio Manager
+        chair_prompt = build_chair_prompt(context, plan_text, peer_statements)
+        chair_solution = await self._run_agent_turn(chair_agent, chair_prompt)
+        chair_text = chair_solution.answer
+        chair_signal = self._extract_signal(chair_text)
+        chair_action = _ACTION_BY_SIGNAL.get(chair_signal, current_recommendation.action)
+        chair_exposure = parse_target_exposure_pct(chair_text)
+        if chair_exposure is None:
+            chair_exposure = plan_exposure
+        chair_confidence = parse_confidence(chair_text)
+        rounds.append(
+            DiscussionRound(
+                round_number=risk_round_index + 1,
+                stage="chair",
+                candidate_action=chair_action.value,
+                candidate_confidence=chair_confidence if chair_confidence is not None else current_recommendation.confidence,
+                agents=[
+                    DiscussionAgentEntry(
+                        agent_id=chair_agent.agent_id,
+                        role="chair",
+                        stance="final",
+                        current_signal=chair_signal,
+                        summary=self._summary_from_answer(chair_text),
+                        message=chair_text,
+                    )
+                ],
+            )
+        )
+        await emit("debate_round_finished", round_number=risk_round_index + 1, stage="chair")
+
+        position_suggestion = dict(current_recommendation.position_suggestion or {})
+        if chair_exposure is not None:
+            position_suggestion["target_exposure_pct"] = chair_exposure
+        final_confidence = chair_confidence if chair_confidence is not None else max(
+            current_recommendation.confidence, chair_solution.confidence
+        )
+        new_recommendation = InvestmentRecommendation(
+            action=chair_action,
+            confidence=max(0.0, min(1.0, final_confidence)),
+            position_suggestion=position_suggestion,
+            decision_rationale=self._summary_from_answer(chair_text) or current_recommendation.decision_rationale,
+        )
+
+        weighted_votes = self._calculate_weighted_votes(agent_outputs)
+        view = ConsensusResultView(
+            enabled=True,
+            rounds_used=len(rounds),
+            consensus_reached=True,
+            final_action=chair_action.value,
+            weighted_votes=weighted_votes,
+        )
+        trace = ConsensusTrace(
+            discussion_enabled=True,
+            final_summary=self._summary_from_answer(chair_text),
+            rounds=rounds,
+        )
+        return view, new_recommendation, trace
 
     async def _run_roundtable(
         self,
