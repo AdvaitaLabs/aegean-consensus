@@ -6,7 +6,7 @@ Based on paper Algorithm 1 (Section 5)
 
 import asyncio
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 import logging
 
@@ -17,8 +17,13 @@ from aegean.core.models import (
     ConsensusResult,
     ConsensusConfig,
     ConsensusStatus,
+    RoundSnapshot,
 )
-from aegean.core.decision_engine import DecisionEngine, DefaultDecisionEngine
+from aegean.core.decision_engine import (
+    DecisionEngine,
+    DefaultDecisionEngine,
+    WeightedDecisionEngine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,26 +116,52 @@ class ConsensusCoordinator:
             initial_solutions = await self._collect_initial_solutions(agents, task)
             state.solutions_history.append(initial_solutions)
             state.current_round = 1
-            
+
             logger.info(
                 f"Collected {len(initial_solutions)} initial solutions "
                 f"(quorum: {self.config.quorum_size})"
             )
-            
+
             # Step 3: Refinement loop (Algorithm 1, Line 7-12)
             state.status = ConsensusStatus.REFINING
             refinement_set = initial_solutions
-            
+
+            # Per-round snapshot tracking. We record agent solutions plus
+            # the weighted-vote tally so downstream UIs can show how the
+            # discussion progressed instead of just the final answer.
+            rounds_history: List[RoundSnapshot] = []
+
             while state.current_round <= self.config.max_rounds:
                 logger.info(f"Starting refinement round {state.current_round}")
-                
+
                 # Evaluate current solutions
                 candidate, should_terminate = self.decision_engine.evaluate(
                     solutions=refinement_set,
                     round_num=state.current_round,
                     previous_candidate=state.candidate_solution,
                 )
-                
+
+                # Compute weighted votes for this round if the engine
+                # exposes them. Falls back to plain counter.
+                weighted_votes = self._compute_weighted_votes(refinement_set)
+
+                # Record snapshot BEFORE we possibly break
+                rounds_history.append(
+                    RoundSnapshot(
+                        round_number=state.current_round,
+                        quorum_reached=bool(candidate is not None),
+                        candidate_answer=candidate.answer if candidate else None,
+                        candidate_confidence=(
+                            float(candidate.confidence) if candidate else 0.0
+                        ),
+                        agent_solutions=list(refinement_set),
+                        weighted_votes=weighted_votes,
+                        stability_counter=getattr(
+                            self.decision_engine, "stability_counter", 0
+                        ),
+                    )
+                )
+
                 # Update state
                 if candidate:
                     state.candidate_solution = candidate
@@ -139,27 +170,27 @@ class ConsensusCoordinator:
                         f"Candidate: {candidate.answer} "
                         f"(stability: {state.stability_counter}/{self.config.stability_horizon})"
                     )
-                
+
                 # Check termination
                 if should_terminate:
                     state.status = ConsensusStatus.CONSENSUS_REACHED
                     logger.info(f"Consensus reached after {state.current_round} rounds")
                     break
-                
+
                 # Check max rounds
                 if state.current_round >= self.config.max_rounds:
                     logger.warning(f"Max rounds ({self.config.max_rounds}) reached")
                     break
-                
+
                 # Refine solutions for next round
                 state.current_round += 1
                 refinement_set = await self._refine_solutions(agents, refinement_set)
                 state.solutions_history.append(refinement_set)
-            
+
             # Build result
             state.completed_at = datetime.now()
             execution_time = (state.completed_at - start_time).total_seconds()
-            
+
             result = ConsensusResult(
                 consensus_id=consensus_id,
                 success=state.status == ConsensusStatus.CONSENSUS_REACHED,
@@ -168,6 +199,7 @@ class ConsensusCoordinator:
                 participating_agents=state.participating_agents,
                 execution_time=execution_time,
                 consensus_reached=state.status == ConsensusStatus.CONSENSUS_REACHED,
+                rounds_history=rounds_history,
             )
             
             logger.info(
@@ -192,6 +224,36 @@ class ConsensusCoordinator:
                 consensus_reached=False,
                 error_message=str(e),
             )
+
+    def _compute_weighted_votes(self, solutions: List[Solution]) -> Dict[str, float]:
+        """
+        Return {normalised_answer: total_vote_weight} for one round.
+
+        Uses the agent registry's capability_weight * solution.confidence
+        when available, otherwise falls back to a plain count. The keys are
+        the same answer strings the decision engine sees (after normalisation
+        if a normaliser is configured) so the snapshot stays consistent
+        with the engine's decision.
+        """
+        normalizer = getattr(self.decision_engine, "answer_normalizer", None)
+
+        def _norm(ans: str) -> str:
+            if normalizer is None:
+                return ans
+            try:
+                return normalizer.normalize(ans, {})
+            except Exception:
+                return ans
+
+        votes: Dict[str, float] = {}
+        for s in solutions:
+            agent = self.agent_registry.get_agent(s.agent_id)
+            agent_weight = float(getattr(agent, "capability_weight", 1.0)) if agent else 1.0
+            confidence = float(s.confidence) if s.confidence is not None else 1.0
+            weight = max(agent_weight * confidence, 0.0)
+            key = _norm(s.answer)
+            votes[key] = votes.get(key, 0.0) + weight
+        return votes
 
     async def _elect_leader(self) -> Agent:
         """

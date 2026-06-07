@@ -148,6 +148,23 @@ class ConsensusState(BaseModel):
     completed_at: Optional[datetime] = None
 
 
+class RoundSnapshot(BaseModel):
+    """
+    One round of the refinement loop, exposed to API consumers.
+
+    Lets downstream services (AegeanBench, dashboards) render the
+    multi-agent discussion trace: who said what at each step, how the
+    weighted vote shifted, whether quorum was reached.
+    """
+    round_number: int = Field(..., ge=0)
+    quorum_reached: bool = False
+    candidate_answer: Optional[str] = None
+    candidate_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    agent_solutions: List[Solution] = Field(default_factory=list)
+    weighted_votes: Dict[str, float] = Field(default_factory=dict)
+    stability_counter: int = Field(0, ge=0)
+
+
 class ConsensusResult(BaseModel):
     """Final result of consensus execution."""
     consensus_id: str
@@ -160,6 +177,13 @@ class ConsensusResult(BaseModel):
     consensus_reached: bool = Field(False)
     error_message: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # NEW: per-round discussion trace. Empty for stateless callers that
+    # don't want the verbose payload; populated when callers ask for it
+    # via include_rounds_history in the API request body.
+    rounds_history: List[RoundSnapshot] = Field(
+        default_factory=list,
+        description="Per-round agent solutions + weighted votes for UI rendering",
+    )
 
     class Config:
         json_schema_extra = {
