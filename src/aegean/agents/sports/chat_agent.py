@@ -41,8 +41,12 @@ class ChatFetcher:
     """
     Pluggable chat-history fetcher.
 
-    Default implementation hits the colleague's chat service via HTTP.
-    Tests/mock mode inject a callable returning canned messages.
+    Each call optionally targets a single user-created room. When
+    `room_id` is None the chat service returns the aggregate-across-rooms
+    view for the match (useful for the "global pulse" demo). When set,
+    only messages from that room are returned - this is what powers
+    per-room chat experiences without making the consensus engine
+    "global-by-default".
     """
 
     def __init__(
@@ -53,30 +57,40 @@ class ChatFetcher:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def fetch(self, match_id: str, window_minutes: int = DEFAULT_WINDOW_MINUTES) -> Dict[str, Any]:
+    def fetch(
+        self,
+        match_id: str,
+        window_minutes: int = DEFAULT_WINDOW_MINUTES,
+        room_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Return the chat window payload. On any error returns an empty window."""
         try:
             import requests
         except ImportError:
             logger.warning("requests not installed; returning empty chat window")
-            return _empty_window(match_id)
+            return _empty_window(match_id, room_id)
+
+        params: Dict[str, Any] = {"match_id": match_id, "minutes": window_minutes}
+        if room_id:
+            params["room_id"] = room_id
 
         try:
             r = requests.get(
                 f"{self.base_url}/api/v1/chat/window",
-                params={"match_id": match_id, "minutes": window_minutes},
+                params=params,
                 timeout=self.timeout,
             )
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            logger.warning("ChatFetcher failed: %s; returning empty window", e)
-            return _empty_window(match_id)
+            logger.warning("ChatFetcher failed (room=%s): %s; returning empty", room_id, e)
+            return _empty_window(match_id, room_id)
 
 
-def _empty_window(match_id: str) -> Dict[str, Any]:
+def _empty_window(match_id: str, room_id: Optional[str] = None) -> Dict[str, Any]:
     return {
         "match_id": match_id,
+        "room_id": room_id,
         "total_messages": 0,
         "messages": [],
     }
@@ -119,7 +133,7 @@ class ChatAgent(BaseSportsAgent):
         model_name: str = "",
         capability_weight: Optional[float] = None,
         chat_fetcher: Optional[ChatFetcher] = None,
-        chat_fetch_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+        chat_fetch_fn: Optional[Callable[..., Dict[str, Any]]] = None,
         window_minutes: int = DEFAULT_WINDOW_MINUTES,
     ):
         super().__init__(
@@ -129,6 +143,8 @@ class ChatAgent(BaseSportsAgent):
             capability_weight=capability_weight,
         )
         # Either fetcher object OR raw callable. Callable wins if both given.
+        # The callable signature can be either fn(match_id) or
+        # fn(match_id, room_id=...); we adapt below.
         self._chat_fetcher = chat_fetcher
         self._chat_fetch_fn = chat_fetch_fn
         self.window_minutes = window_minutes
@@ -152,17 +168,36 @@ class ChatAgent(BaseSportsAgent):
             return m.group(1)
         return None
 
-    def _fetch_chat(self, match_id: str) -> Dict[str, Any]:
+    @staticmethod
+    def _resolve_room_id(task: str) -> Optional[str]:
+        """
+        Extract optional room_id from the task prompt.
+
+        Convention used by AegeanBench: a single line like
+            Room ID: room_abc123
+        injected into the prompt just before the chat section.
+        """
+        import re
+        m = re.search(
+            r"room[_ ]?id[:=]\s*([A-Za-z0-9\-_]+)", task, re.IGNORECASE
+        )
+        return m.group(1) if m else None
+
+    def _fetch_chat(self, match_id: str, room_id: Optional[str] = None) -> Dict[str, Any]:
         if self._chat_fetch_fn is not None:
             try:
-                return self._chat_fetch_fn(match_id)
+                # Support both legacy fn(match_id) and new fn(match_id, room_id=...)
+                try:
+                    return self._chat_fetch_fn(match_id, room_id=room_id)
+                except TypeError:
+                    return self._chat_fetch_fn(match_id)
             except Exception as e:
                 logger.warning("chat_fetch_fn failed: %s", e)
-                return _empty_window(match_id)
+                return _empty_window(match_id, room_id)
         if self._chat_fetcher is not None:
-            return self._chat_fetcher.fetch(match_id, self.window_minutes)
+            return self._chat_fetcher.fetch(match_id, self.window_minutes, room_id=room_id)
         # Default: instantiate a fresh fetcher
-        return ChatFetcher().fetch(match_id, self.window_minutes)
+        return ChatFetcher().fetch(match_id, self.window_minutes, room_id=room_id)
 
     def _format_chat_section(self, chat: Dict[str, Any]) -> str:
         messages: List[Dict[str, Any]] = chat.get("messages", [])
@@ -184,9 +219,12 @@ class ChatAgent(BaseSportsAgent):
         return header + "\n" + "\n".join(lines)
 
     def _build_prompt(self, task: str) -> str:
-        match_id = self._resolve_match_id(task)
-        chat = self._fetch_chat(match_id or "unknown")
+        match_id = self._resolve_match_id(task) or "unknown"
+        room_id = self._resolve_room_id(task)
+        chat = self._fetch_chat(match_id, room_id=room_id)
         chat_section = self._format_chat_section(chat)
+        if room_id:
+            chat_section = f"(room: {room_id})\n" + chat_section
 
         return (
             f"{self.SPECIALIZATION_HINT}\n\n"

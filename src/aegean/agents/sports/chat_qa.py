@@ -47,6 +47,7 @@ class ChatQAResponse:
     rationale: str = ""
     latency_ms: int = 0
     tokens_used: int = 0
+    room_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -58,6 +59,7 @@ class ChatQAResponse:
             "rationale": self.rationale,
             "latency_ms": self.latency_ms,
             "tokens_used": self.tokens_used,
+            "room_id": self.room_id,
             "metadata": self.metadata,
         }
 
@@ -78,14 +80,18 @@ def build_qa_prompt(
     match_context: Optional[str] = None,
     recent_messages: Optional[List[Dict[str, Any]]] = None,
     user_name: Optional[str] = None,
+    room_id: Optional[str] = None,
 ) -> str:
     """
     Build the one-shot Q&A prompt.
 
     The agent's specialisation hint colours its answer. The match_context
     (if provided) gives the agent the latest match facts. recent_messages
-    are short-term session context (last few user turns), not persistent
-    history.
+    are short-term session context (last few user turns from the same
+    chat room), not persistent history.
+
+    room_id is included only as a soft hint to the LLM ("you are answering
+    inside room X"); we do not maintain per-room persistent memory.
     """
     parts: List[str] = [
         agent.SPECIALIZATION_HINT,
@@ -95,12 +101,15 @@ def build_qa_prompt(
         "Keep the answer short (1-3 sentences). Be specific.",
         "",
     ]
+    if room_id:
+        parts.append(f"(Replying in chat room {room_id})")
+        parts.append("")
     if match_context:
         parts.append("--- MATCH CONTEXT (current match being discussed) ---")
         parts.append(match_context)
         parts.append("")
     if recent_messages:
-        parts.append("--- RECENT CONVERSATION (most recent last) ---")
+        parts.append("--- RECENT CONVERSATION IN THIS ROOM (most recent last) ---")
         for msg in recent_messages[-5:]:
             who = msg.get("user_name", "user")
             text = (msg.get("text") or "").strip()
@@ -135,6 +144,7 @@ class ChatQAHandler:
         match_context: Optional[str] = None,
         recent_messages: Optional[List[Dict[str, Any]]] = None,
         user_name: Optional[str] = None,
+        room_id: Optional[str] = None,
     ) -> ChatQAResponse:
         """
         Route the question to the named agent and return a structured response.
@@ -142,31 +152,29 @@ class ChatQAHandler:
         Returns a fallback ChatQAResponse if the agent is unknown, the LLM
         is unconfigured, or the call fails. This handler never raises into
         the chat-service callers.
+
+        room_id, when provided, is forwarded to the prompt so the agent can
+        soft-reference "this room" in its answer. We do not persist per-room
+        state - the chat service owns room membership and message history.
         """
         agent = self.agent_registry.get_agent(agent_id)
         if agent is None:
             return ChatQAResponse(
-                agent_id=agent_id,
-                question=question,
+                agent_id=agent_id, question=question, room_id=room_id,
                 answer=f"Sorry, no agent named '{agent_id}' is available.",
-                confidence=0.0,
-                metadata={"error": "unknown_agent"},
+                confidence=0.0, metadata={"error": "unknown_agent"},
             )
         if not isinstance(agent, BaseSportsAgent):
             return ChatQAResponse(
-                agent_id=agent_id,
-                question=question,
+                agent_id=agent_id, question=question, room_id=room_id,
                 answer="That agent does not handle conversational Q&A.",
-                confidence=0.0,
-                metadata={"error": "wrong_agent_type"},
+                confidence=0.0, metadata={"error": "wrong_agent_type"},
             )
         if agent._llm is None:
             return ChatQAResponse(
-                agent_id=agent_id,
-                question=question,
+                agent_id=agent_id, question=question, room_id=room_id,
                 answer="LLM not configured for this agent.",
-                confidence=0.0,
-                metadata={"error": "no_llm"},
+                confidence=0.0, metadata={"error": "no_llm"},
             )
 
         prompt = build_qa_prompt(
@@ -175,6 +183,7 @@ class ChatQAHandler:
             match_context=match_context,
             recent_messages=recent_messages,
             user_name=user_name,
+            room_id=room_id,
         )
 
         start = time.perf_counter()
@@ -183,8 +192,7 @@ class ChatQAHandler:
         except Exception as e:
             logger.warning("chat-qa LLM call failed for %s: %s", agent_id, e)
             return ChatQAResponse(
-                agent_id=agent_id,
-                question=question,
+                agent_id=agent_id, question=question, room_id=room_id,
                 answer="Sorry, I could not answer right now. Try again in a moment.",
                 confidence=0.0,
                 latency_ms=int((time.perf_counter() - start) * 1000),
@@ -196,8 +204,7 @@ class ChatQAHandler:
         except ValueError:
             # Some LLMs may return raw prose despite the contract; accept it
             return ChatQAResponse(
-                agent_id=agent_id,
-                question=question,
+                agent_id=agent_id, question=question, room_id=room_id,
                 answer=(raw or "").strip()[:500],
                 confidence=0.5,
                 latency_ms=int((time.perf_counter() - start) * 1000),
@@ -210,6 +217,7 @@ class ChatQAHandler:
         return ChatQAResponse(
             agent_id=agent_id,
             question=question,
+            room_id=room_id,
             answer=str(parsed.get("answer", "")).strip(),
             confidence=float(parsed.get("confidence", 0.5)),
             rationale=str(parsed.get("rationale", "")),
