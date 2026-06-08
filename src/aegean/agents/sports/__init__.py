@@ -14,6 +14,7 @@ Public entry points:
 """
 
 from aegean.agents.sports.base_sports_agent import BaseSportsAgent
+from aegean.agents.sports.iching_agent import IChingAgent
 from aegean.agents.sports.chat_agent import ChatAgent, ChatFetcher
 from aegean.agents.sports.chat_qa import ChatQAHandler, ChatQAResponse
 from aegean.agents.sports.factory import (
@@ -35,6 +36,7 @@ __all__ = [
     "MarketAgent",
     "NewsAgent",
     "OccultAgent",
+    "IChingAgent",
     "ChatAgent",
     "ChatFetcher",
     "ChatQAHandler",
