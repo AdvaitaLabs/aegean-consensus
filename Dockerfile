@@ -36,6 +36,6 @@ COPY main.py /app/
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fs http://localhost:8000/api/v1/health || exit 1
+    CMD curl -fs http://localhost:8000/health || exit 1
 
 CMD ["python", "main.py", "--port", "8000"]
