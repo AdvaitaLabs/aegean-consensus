@@ -9,10 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml requirements*.txt ./
-RUN pip install --user --no-cache-dir \
-    fastapi uvicorn httpx pydantic requests \
-    openai anthropic
+COPY requirements.txt ./
+RUN pip install --user --no-cache-dir -r requirements.txt
 
 # ----------------------------- runtime -----------------------------
 
@@ -25,6 +23,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
 WORKDIR /app
+
+# curl needed for HEALTHCHECK
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /root/.local /root/.local
 
