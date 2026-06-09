@@ -834,10 +834,10 @@ class GroupChatService:
         
         weighted_votes, total_weight = None, None
         if initial_responses:
-            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
+            weighted_votes, total_weight, _ = decision_engine._calculate_weighted_votes(
                 initial_responses
             )
-        
+
         return {
             "success": result.success,
             "agent_responses": initial_responses,
@@ -903,7 +903,7 @@ class GroupChatService:
         
         weighted_votes, total_weight = None, None
         if agent_responses:
-            weighted_votes, total_weight = decision_engine._calculate_weighted_votes(
+            weighted_votes, total_weight, _ = decision_engine._calculate_weighted_votes(
                 agent_responses
             )
         
