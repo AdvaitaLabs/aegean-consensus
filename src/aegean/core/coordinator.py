@@ -321,7 +321,12 @@ class ConsensusCoordinator:
         Returns:
             List of refined solutions
         """
-        if self.config.enable_early_termination:
+        # Refinement rounds: honor wait_all_in_refinement to barrier-
+        # sync so every agent gets to react to peers. Otherwise the
+        # first 2 to finish dominate every round and the chat trace
+        # shows only those 2.
+        if (self.config.enable_early_termination
+                and not getattr(self.config, "wait_all_in_refinement", False)):
             return await self._collect_with_early_termination(
                 agents, refinement_set, is_refinement=True
             )

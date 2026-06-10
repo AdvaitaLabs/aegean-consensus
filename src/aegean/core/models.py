@@ -134,6 +134,11 @@ class ConsensusConfig(BaseModel):
     # if it's enabled. Set True for sports/UX use cases where the
     # front-end wants to render every specialist's first take.
     wait_all_in_initial_round: bool = Field(False, description="Disable early termination for round 0")
+    # When True, refinement rounds also wait for all agents (barrier
+    # sync). Slower (every round runs N LLM calls) but lets the chat
+    # UI render every specialist's reaction to peers, not just the
+    # first 2 to finish. Set True for the sports chat UX.
+    wait_all_in_refinement: bool = Field(False, description="Disable early termination for refinement rounds")
     enable_openclaw: bool = Field(False, description="Enable OpenClaw integration")
 
 

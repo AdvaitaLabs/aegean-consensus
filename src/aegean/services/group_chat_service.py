@@ -909,6 +909,7 @@ class GroupChatService:
             config=ConsensusConfig(
                 max_rounds=max_rounds,
                 stability_horizon=stability_horizon,
+                wait_all_in_refinement=True,
                 # Round 0 barrier sync so every specialist's first lens
                 # answer is captured. Refinement rounds keep early-term.
                 wait_all_in_initial_round=True,
@@ -1001,6 +1002,7 @@ class GroupChatService:
             config=ConsensusConfig(
                 max_rounds=max_rounds,
                 stability_horizon=stability_horizon,
+                wait_all_in_refinement=True,
                 # Round 0 barrier sync so every specialist's first lens
                 # answer is captured. Refinement rounds keep early-term.
                 wait_all_in_initial_round=True,
