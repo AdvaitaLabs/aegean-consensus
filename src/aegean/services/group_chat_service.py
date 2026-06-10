@@ -898,7 +898,13 @@ class GroupChatService:
 
         coordinator = ConsensusCoordinator(
             agent_registry=registry,
-            config=ConsensusConfig(max_rounds=max_rounds, stability_horizon=stability_horizon),
+            config=ConsensusConfig(
+                max_rounds=max_rounds,
+                stability_horizon=stability_horizon,
+                # Round 0 barrier sync so every specialist's first lens
+                # answer is captured. Refinement rounds keep early-term.
+                wait_all_in_initial_round=True,
+            ),
             decision_engine=decision_engine,
         )
 
@@ -976,7 +982,13 @@ class GroupChatService:
 
         coordinator = ConsensusCoordinator(
             agent_registry=registry,
-            config=ConsensusConfig(max_rounds=max_rounds, stability_horizon=stability_horizon),
+            config=ConsensusConfig(
+                max_rounds=max_rounds,
+                stability_horizon=stability_horizon,
+                # Round 0 barrier sync so every specialist's first lens
+                # answer is captured. Refinement rounds keep early-term.
+                wait_all_in_initial_round=True,
+            ),
             decision_engine=decision_engine,
         )
 

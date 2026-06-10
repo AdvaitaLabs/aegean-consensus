@@ -286,8 +286,12 @@ def _register_minimal_agents_multi(registry, per_agent_clients: list):
             super().__init__(agent_id=agent_id, **kwargs)
             self._llm = llm_client
             self._model_name = model_name
+            # Remember the most recent task so refine_solution can re-run
+            # the LLM with both the task context AND the peer answers.
+            self._last_task: str = ""
 
         async def generate_solution(self, task: str) -> Solution:
+            self._last_task = task
             if self._llm:
                 try:
                     answer = await self._llm.complete(
@@ -313,25 +317,81 @@ def _register_minimal_agents_multi(registry, per_agent_clients: list):
             )
 
         async def refine_solution(self, refinement_set) -> Solution:
+            """
+            Real LLM-driven refinement: re-read the original task, see
+            what peers said, and produce THIS agent's own updated take.
+            The old behaviour was to copy the majority answer verbatim,
+            which collapsed all agents to identical rationale strings
+            from round 2 onward — UX disaster for the chat view.
+            """
             if not refinement_set:
                 return await self.generate_solution("refinement")
-            from collections import Counter
-            from aegean.core.models import TokenUsage as _TU
-            answers = [s.answer for s in refinement_set]
-            majority = Counter(answers).most_common(1)[0][0]
-            # Aggregate token usage already tracked in peer solutions
-            tp = sum(getattr(s, "tokens_prompt", 0) for s in refinement_set)
-            tc = sum(getattr(s, "tokens_completion", 0) for s in refinement_set)
-            tu = _TU(tokens_prompt=tp, tokens_completion=tc, tokens_total=tp + tc)
-            return Solution(
-                agent_id=self.agent_id,
-                answer=majority,
-                confidence=0.75,
-                reasoning="Refined based on peer solutions",
-                tokens_prompt=tp,
-                tokens_completion=tc,
-                usage=tu,
+
+            if not self._llm:
+                # No LLM configured: fall back to majority copy (legacy).
+                from collections import Counter
+                answers = [s.answer for s in refinement_set]
+                majority = Counter(answers).most_common(1)[0][0]
+                return Solution(
+                    agent_id=self.agent_id,
+                    answer=majority,
+                    confidence=0.6,
+                    reasoning="Refined (no LLM available)",
+                )
+
+            # Compose a refinement prompt that includes peer takes.
+            peer_block_parts = []
+            for s in refinement_set:
+                if s.agent_id == self.agent_id:
+                    continue
+                peer_block_parts.append(
+                    f"- {s.agent_id} (confidence {s.confidence:.2f}): {s.answer}"
+                )
+            peer_block = "\n".join(peer_block_parts) or "(no peer answers)"
+
+            refinement_prompt = (
+                f"Task: {self._last_task}\n\n"
+                f"Your previous teammates produced these answers:\n"
+                f"{peer_block}\n\n"
+                f"Now produce YOUR OWN updated answer. You may adjust based "
+                f"on what your peers said, but keep your specialty's angle. "
+                f"Stay in the same output format as before (JSON when the "
+                f"task asks for JSON, prose otherwise)."
             )
+
+            try:
+                answer = await self._llm.complete(refinement_prompt)
+                raw_usage = getattr(self._llm, "last_usage", None) or {}
+                from aegean.core.models import TokenUsage as _TU
+                tu = _TU.from_raw(raw_usage)
+                return Solution(
+                    agent_id=self.agent_id,
+                    answer=answer,
+                    confidence=0.78,
+                    reasoning="Refined with peer context",
+                    tokens_prompt=tu.tokens_prompt,
+                    tokens_completion=tu.tokens_completion,
+                    usage=tu,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"{self.agent_id} ({self._model_name}) refine LLM failed: {e}"
+                )
+                # Last-resort: keep prior answer alive rather than copy peers
+                from aegean.core.models import TokenUsage as _TU
+                tu = _TU(tokens_prompt=0, tokens_completion=0, tokens_total=0)
+                self_prev = next(
+                    (s for s in refinement_set if s.agent_id == self.agent_id),
+                    None,
+                )
+                kept_answer = self_prev.answer if self_prev else refinement_set[0].answer
+                return Solution(
+                    agent_id=self.agent_id,
+                    answer=kept_answer,
+                    confidence=0.5,
+                    reasoning="Refine LLM call failed; kept prior answer",
+                    usage=tu,
+                )
 
     for i, (model_name, llm_client) in enumerate(per_agent_clients):
         agent = MinimalAgent(

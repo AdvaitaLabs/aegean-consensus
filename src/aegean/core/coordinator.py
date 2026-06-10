@@ -292,7 +292,12 @@ class ConsensusCoordinator:
         Returns:
             List of solutions (at least quorum_size)
         """
-        if self.config.enable_early_termination:
+        # Round 0 / initial proposal:
+        #   wait_all_in_initial_round=True forces barrier sync so EVERY
+        #   agent's first lens-flavored solution lands in the trace.
+        #   Otherwise honor enable_early_termination as before.
+        if (self.config.enable_early_termination
+                and not getattr(self.config, "wait_all_in_initial_round", False)):
             return await self._collect_with_early_termination(
                 agents, task, is_refinement=False
             )

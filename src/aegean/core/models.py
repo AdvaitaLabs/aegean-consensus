@@ -128,6 +128,12 @@ class ConsensusConfig(BaseModel):
     max_rounds: int = Field(5, ge=1, description="Maximum refinement rounds")
     timeout: int = Field(300, ge=1, description="Timeout in seconds")
     enable_early_termination: bool = Field(True, description="Cancel slow agents after quorum")
+    # When True, the initial proposal round waits for ALL agents to
+    # produce a solution (barrier sync) instead of cutting off at
+    # quorum_size. Refinement rounds still honor early termination
+    # if it's enabled. Set True for sports/UX use cases where the
+    # front-end wants to render every specialist's first take.
+    wait_all_in_initial_round: bool = Field(False, description="Disable early termination for round 0")
     enable_openclaw: bool = Field(False, description="Enable OpenClaw integration")
 
 
