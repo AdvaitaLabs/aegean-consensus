@@ -70,6 +70,7 @@ class DiscussionTracker:
         candidate_answer: Optional[str] = None,
         candidate_confidence: Optional[float] = None,
         stability_counter: int = 0,
+        weighted_votes: Optional[Dict[str, float]] = None,
     ) -> RoundDiscussion:
         """
         Record a consensus round.
@@ -104,6 +105,7 @@ class DiscussionTracker:
             candidate_answer=candidate_answer,
             candidate_confidence=candidate_confidence,
             stability_counter=stability_counter,
+            weighted_votes=weighted_votes or {},
         )
         
         self.rounds.append(round_discussion)

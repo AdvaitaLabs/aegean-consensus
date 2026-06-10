@@ -35,6 +35,88 @@ from aegean.core.discussion_tracker import DiscussionTracker
 from aegean.core.graph_extractor import RiskGraphBuilder
 from aegean.memory.global_memory import GlobalMemorySystem
 from aegean.memory.knowledge_base import KnowledgeBase
+from aegean.core.models import Solution as _Solution
+
+
+# ----------------------------------------------------------------------
+# Lens hints used by consensus mode to differentiate sports-style agents.
+#
+# Without these every MinimalAgent sees the same task, calls the same
+# LLM, and returns near-identical JSON — collapsing the consensus into
+# a single voice. The hint is appended to the task before each agent
+# generates its solution, so they all see the shared data but reason
+# from distinct angles. Roles not listed here keep the original task.
+# ----------------------------------------------------------------------
+
+_LENS_HINTS: Dict[str, str] = {
+    "stats_specialist": (
+        "You are the STATS specialist. Anchor your answer in xG, PPDA, "
+        "possession, and the last 10 internationals. Down-weight "
+        "narrative reasoning. If a stat is missing say so explicitly."
+    ),
+    "player_specialist": (
+        "You are the PLAYER specialist. Focus on key player availability, "
+        "form, injuries, and suspensions. A missing star striker should "
+        "materially shift probabilities."
+    ),
+    "strategy_specialist": (
+        "You are the TACTICS specialist. Focus on tactical fit: pressing "
+        "intensity, formation matchups, head-to-head patterns, set-piece "
+        "tendencies."
+    ),
+    "market_specialist": (
+        "You are the MARKET specialist. Anchor your answer in bookmaker "
+        "consensus. Be skeptical of deviating far from the market unless "
+        "underlying data clearly contradicts it."
+    ),
+    "news_specialist": (
+        "You are the NEWS specialist. Focus on recent narrative shifts: "
+        "manager pressers, locker-room mood, weather, travel fatigue."
+    ),
+    "chat_specialist": (
+        "You are the CHAT specialist. Treat the recent chat sentiment as "
+        "your primary signal. Audience mood often anticipates short-term "
+        "edges but tends to be over-confident on home sides."
+    ),
+    "occult_specialist": (
+        "You are the OCCULT specialist. Frame your reasoning through "
+        "tarot / astrological lens. Output the same JSON schema but the "
+        "rationale should reference symbolic patterns rather than data."
+    ),
+    "iching_specialist": (
+        "You are the I CHING specialist. Frame your reasoning through "
+        "the primary hexagram and any changing lines. Same JSON schema."
+    ),
+}
+
+
+class _RoleScopedAgent(Agent):
+    """
+    Thin wrapper that injects a role-specific lens hint into the task
+    before delegating to the underlying agent. Keeps the wrapped agent's
+    agent_id and capability_weight so the registry, voting and trace
+    code remain unchanged.
+    """
+
+    def __init__(self, inner: Agent, role: Optional[str], lens: Optional[str]):
+        super().__init__(
+            agent_id=inner.agent_id,
+            capability_weight=getattr(inner, "capability_weight", 1.0),
+            specialization=getattr(inner, "specialization", None),
+            role=role or getattr(inner, "role", None),
+        )
+        self._inner = inner
+        self._lens = lens or ""
+
+    async def generate_solution(self, task: str) -> _Solution:  # type: ignore[override]
+        scoped = (
+            f"{task}\n\n## YOUR LENS ({self.role})\n{self._lens}\n"
+            "Now output the JSON answer."
+        ) if self._lens else task
+        return await self._inner.generate_solution(scoped)
+
+    async def refine_solution(self, refinement_set):  # type: ignore[override]
+        return await self._inner.refine_solution(refinement_set)
 
 
 class GroupChatService:
@@ -672,10 +754,12 @@ class GroupChatService:
                 discussion_tracker
             )
         else:
-            # Consensus mode (default): all agents answer same question, weighted voting
+            # Consensus mode (default): all agents answer same question, weighted voting.
+            # Pass agent_id -> role so each agent can be lens-scoped.
+            agent_roles = {m.agent_id: (m.role or "") for m in active_members}
             result = await self._execute_consensus_voting(
                 agents, task, quorum_threshold, stability_horizon, max_rounds,
-                discussion_tracker
+                discussion_tracker, agent_roles=agent_roles,
             )
         
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -861,18 +945,33 @@ class GroupChatService:
         stability_horizon: int,
         max_rounds: int,
         discussion_tracker: DiscussionTracker,
+        agent_roles: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Consensus mode: all agents answer same question, weighted voting.
+
+        When `agent_roles` maps an agent_id to a non-empty role
+        (e.g. "stats_specialist"), the agent is wrapped in a lens-
+        scoped adapter so each one tackles the task from its own angle
+        rather than producing carbon-copy answers.
         """
         decision_engine = WeightedDecisionEngine(
             quorum_threshold=quorum_threshold,
             stability_horizon=stability_horizon,
             agent_registry=self.agent_registry
         )
-        
-        registry = AgentRegistry()
+
+        # Wrap agents with a role-specific lens prompt when a role is
+        # configured. The wrapper preserves agent_id / weight so the
+        # registry, voting and trace keep working unchanged.
+        scoped_agents: List[Agent] = []
         for agent in agents:
+            role = (agent_roles or {}).get(agent.agent_id)
+            lens = _LENS_HINTS.get(role) if role else None
+            scoped_agents.append(_RoleScopedAgent(agent, role, lens) if lens else agent)
+
+        registry = AgentRegistry()
+        for agent in scoped_agents:
             registry.register_agent(agent)
 
         coordinator = ConsensusCoordinator(
@@ -882,22 +981,31 @@ class GroupChatService:
         )
 
         result = await coordinator.run_consensus(task)
-        
+
         agent_responses = []
         discussion_rounds = []
-        
+
         # Record discussion rounds
         if result.success and coordinator.state.solutions_history:
             for round_num, solutions in enumerate(coordinator.state.solutions_history, 1):
                 agent_responses = solutions
-                
-                # Create round discussion record
+
+                # Compute this round's weighted vote distribution so the
+                # front-end can render per-round vote movement.
+                round_votes: Dict[str, float] = {}
+                try:
+                    rv, _rw, _ = decision_engine._calculate_weighted_votes(solutions)
+                    round_votes = dict(rv or {})
+                except Exception:  # noqa: BLE001
+                    round_votes = {}
+
                 round_disc = discussion_tracker.record_round(
                     round_number=round_num,
                     agent_responses={s.agent_id: s for s in solutions},
                     candidate_answer=coordinator.state.candidate_solution.answer if coordinator.state.candidate_solution else None,
                     candidate_confidence=coordinator.state.candidate_solution.confidence if coordinator.state.candidate_solution else None,
                     stability_counter=coordinator.state.stability_counter,
+                    weighted_votes=round_votes,
                 )
                 discussion_rounds.append(round_disc)
         

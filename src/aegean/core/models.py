@@ -331,6 +331,10 @@ class RoundDiscussion(BaseModel):
     stability_counter: int = Field(0, ge=0)
     consensus_status: str = Field("ongoing")
     timestamp: datetime = Field(default_factory=datetime.now)
+    # Weighted vote distribution for this round, keyed by normalized
+    # answer label (e.g. "home_win", "draw", "away_win" for sports).
+    # Empty until the orchestrator populates it via record_round().
+    weighted_votes: Dict[str, float] = Field(default_factory=dict)
 
 
 class KnowledgeGraphEntity(BaseModel):
