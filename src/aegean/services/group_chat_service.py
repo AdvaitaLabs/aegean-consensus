@@ -886,10 +886,18 @@ class GroupChatService:
             }
         
         # Phase 2: Consensus on results
+        # Sports tasks: each agent now produces a free-form JSON blob
+        # whose `rationale` text differs per agent. Without an answer
+        # normalizer the IdentityNormalizer compares the raw strings
+        # and never finds a quorum -> success=False. We install the
+        # MatchOutcomeNormalizer so votes are bucketed by outcome label
+        # (home_win / draw / away_win) instead of exact-string match.
+        from aegean.core.answer_normalizer import MatchOutcomeNormalizer
         decision_engine = WeightedDecisionEngine(
             quorum_threshold=quorum_threshold,
             stability_horizon=stability_horizon,
-            agent_registry=self.agent_registry
+            agent_registry=self.agent_registry,
+            answer_normalizer=MatchOutcomeNormalizer(),
         )
 
         registry = AgentRegistry()
@@ -961,10 +969,18 @@ class GroupChatService:
         scoped adapter so each one tackles the task from its own angle
         rather than producing carbon-copy answers.
         """
+        # Sports tasks: each agent now produces a free-form JSON blob
+        # whose `rationale` text differs per agent. Without an answer
+        # normalizer the IdentityNormalizer compares the raw strings
+        # and never finds a quorum -> success=False. We install the
+        # MatchOutcomeNormalizer so votes are bucketed by outcome label
+        # (home_win / draw / away_win) instead of exact-string match.
+        from aegean.core.answer_normalizer import MatchOutcomeNormalizer
         decision_engine = WeightedDecisionEngine(
             quorum_threshold=quorum_threshold,
             stability_horizon=stability_horizon,
-            agent_registry=self.agent_registry
+            agent_registry=self.agent_registry,
+            answer_normalizer=MatchOutcomeNormalizer(),
         )
 
         # Wrap agents with a role-specific lens prompt when a role is
