@@ -88,7 +88,7 @@ def _build_simple_openai_client(api_key: str):
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
-                    max_tokens=512,
+                    max_tokens=1500,
                 )
                 usage = getattr(resp, "usage", None)
                 self.last_usage = {
@@ -125,7 +125,7 @@ def _build_simple_anthropic_client(api_key: str):
             async def complete(self, prompt: str) -> str:
                 msg = await self.client.messages.create(
                     model=self.model,
-                    max_tokens=512,
+                    max_tokens=1500,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 usage = getattr(msg, "usage", None)
@@ -218,7 +218,7 @@ def _build_simple_openai_client_with(api_key: str, model: str, base_url: str = N
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
-                    max_tokens=512,
+                    max_tokens=1500,
                 )
                 usage = getattr(resp, "usage", None)
                 self.last_usage = {
