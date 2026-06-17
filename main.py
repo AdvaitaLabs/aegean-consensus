@@ -84,19 +84,43 @@ def _build_simple_openai_client(api_key: str):
                 self.last_provider = "openai"
 
             async def complete(self, prompt: str) -> str:
-                resp = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=1500,
-                )
-                usage = getattr(resp, "usage", None)
-                self.last_usage = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
-                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
-                    "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
-                }
-                return resp.choices[0].message.content or ""
+                # See PerModelClient.complete: retry empty/failed responses
+                # before giving up so a transient Praka hiccup doesn't
+                # cascade into a mock fallback.
+                import asyncio
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        resp = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.1,
+                            max_tokens=1500,
+                        )
+                        usage = getattr(resp, "usage", None)
+                        self.last_usage = {
+                            "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                            "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                            "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+                        }
+                        content = resp.choices[0].message.content or ""
+                        if content.strip():
+                            return content
+                        logger.warning(
+                            "Empty LLM response (model=%s, attempt %d/3); retrying",
+                            self.model, attempt + 1,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        last_exc = e
+                        logger.warning(
+                            "LLM call failed (model=%s, attempt %d/3): %s: %s",
+                            self.model, attempt + 1, type(e).__name__, e,
+                        )
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                if last_exc is not None:
+                    raise last_exc
+                return ""
 
         model = os.getenv("OPENAI_MODEL", "gpt-4o")
         base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
@@ -214,19 +238,49 @@ def _build_simple_openai_client_with(api_key: str, model: str, base_url: str = N
                 self.last_provider = "openai"
 
             async def complete(self, prompt: str) -> str:
-                resp = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=1500,
-                )
-                usage = getattr(resp, "usage", None)
-                self.last_usage = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
-                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
-                    "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
-                }
-                return resp.choices[0].message.content or ""
+                # Praka/opus occasionally returns an empty body (content
+                # == '' or null), which downstream parses as
+                # "Could not parse JSON from LLM response: ''" and trips
+                # the consensus -> mock fallback. Retry a couple of times
+                # with a short backoff before giving up; an empty string
+                # is treated the same as a transient API error.
+                import asyncio
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        resp = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.1,
+                            max_tokens=1500,
+                        )
+                        usage = getattr(resp, "usage", None)
+                        self.last_usage = {
+                            "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                            "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                            "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+                        }
+                        content = resp.choices[0].message.content or ""
+                        if content.strip():
+                            return content
+                        logger.warning(
+                            "Empty LLM response (model=%s, attempt %d/3); retrying",
+                            self.model, attempt + 1,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        last_exc = e
+                        logger.warning(
+                            "LLM call failed (model=%s, attempt %d/3): %s: %s",
+                            self.model, attempt + 1, type(e).__name__, e,
+                        )
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                # All retries exhausted: re-raise the last error if we had
+                # one, otherwise return '' so the caller's existing
+                # empty-handling path runs (agent fallback solution).
+                if last_exc is not None:
+                    raise last_exc
+                return ""
 
         return PerModelClient(api_key, model, base_url)
     except ImportError:

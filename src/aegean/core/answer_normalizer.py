@@ -77,6 +77,19 @@ class MatchOutcomeNormalizer(AnswerNormalizer):
     )
 
     def normalize(self, answer: str, context: Optional[Dict] = None) -> str:
+        # Sports agents return a JSON object with p_home_win / p_draw /
+        # p_away_win. Take the argmax of those probabilities FIRST.
+        #
+        # This must come before the keyword scan below: the literal
+        # "home_win" is a substring of the JSON key "p_home_win", so the
+        # keyword match labelled EVERY structured answer "home_win"
+        # regardless of the actual probabilities — collapsing every vote
+        # onto the home team and making the consensus always pick whoever
+        # was listed first. Parsing the numbers fixes that at the source.
+        structured = self._argmax_from_probs(answer)
+        if structured is not None:
+            return structured
+
         s = self._clean(answer)
 
         # First try direct keyword match (works regardless of context)
@@ -101,6 +114,43 @@ class MatchOutcomeNormalizer(AnswerNormalizer):
         # Fallback: return cleaned string (will fail to reach quorum,
         # which is the correct behavior for unparseable answers)
         return s
+
+    @staticmethod
+    def _argmax_from_probs(answer: str) -> Optional[str]:
+        """
+        Parse the agent's JSON payload and return the argmax outcome label
+        from p_home_win / p_draw / p_away_win. Returns None when the answer
+        isn't JSON with those keys, so the keyword/team fallbacks still run
+        for free-form answers.
+        """
+        import json
+
+        if not answer or "p_home_win" not in answer:
+            return None
+        # Extract the first {...} block (answers often arrive wrapped in
+        # ```json fences or with trailing prose).
+        start = answer.find("{")
+        end = answer.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            obj = json.loads(answer[start:end + 1])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        try:
+            ph = float(obj["p_home_win"])
+            pd = float(obj["p_draw"])
+            pa = float(obj["p_away_win"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        best = max(ph, pd, pa)
+        if best == pa:
+            return "away_win"
+        if best == pd and pd >= ph:
+            return "draw"
+        return "home_win"
 
     @staticmethod
     def _expand_team_variants(team) -> List[str]:
